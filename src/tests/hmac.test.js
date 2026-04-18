@@ -1,4 +1,4 @@
-const { generateSignature, verifySignature } = require('../src/utils/hmac')
+const { generateSignature, verifySignature } = require('../utils/hmac')
 
 describe('HMAC Signature Utility', () => {
 

@@ -5,10 +5,20 @@ const connectDB = require('./config/db')
 const logger = require('./config/logger')
 const webhookRoutes = require('./routes/webhooks')
 const eventRoutes = require('./routes/events')
+const deadLetterRoutes = require('./routes/deadLetters')
+const { startPendingEventRecovery } = require('./utils/eventQueue')
 
 const app = express()
 
-app.use(express.json())
+// Capture raw body bytes alongside parsed JSON.
+// Required so the delivery worker can sign the exact wire bytes
+// rather than re-serialising a parsed object (which has unstable
+// property order across engines and runtimes).
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf
+  }
+}))
 
 // Rate limiting — tighter on event ingestion, looser on management routes
 const eventLimiter = rateLimit({
@@ -24,6 +34,7 @@ const managementLimiter = rateLimit({
 
 app.use('/events', eventLimiter, eventRoutes)
 app.use('/webhooks', managementLimiter, webhookRoutes)
+app.use('/dead-letters', managementLimiter, deadLetterRoutes)
 
 // Health check
 app.get('/health', (req, res) => {
@@ -43,13 +54,22 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3000
 
-const start = async () => {
+const startServer = async () => {
   await connectDB()
+
   app.listen(PORT, () => {
     logger.info(`Server started on port ${PORT}`)
+    // Start recovery only inside the listen callback — guarantees the DB
+    // connection pool is fully warmed before the first recovery tick runs
+    startPendingEventRecovery()
   })
 }
 
-start()
+if (require.main === module) {
+  startServer().catch((err) => {
+    logger.error('Failed to start server', { error: err.message, stack: err.stack })
+    process.exit(1)
+  })
+}
 
 module.exports = app

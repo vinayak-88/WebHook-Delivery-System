@@ -5,12 +5,19 @@ const crypto = require('crypto')
  * Used to sign every outgoing webhook delivery so subscribers can
  * verify the request actually came from this server.
  *
- * @param {object} payload - The event payload to sign
- * @param {string} secret  - The subscriber's shared secret
- * @returns {string}       - Hex-encoded HMAC signature
+ * Accepts either a Buffer (preferred — raw request bytes, avoids
+ * JSON property-order instability) or a plain object (falls back to
+ * JSON.stringify). Always pass raw body bytes when available.
+ *
+ * @param {Buffer|object} payload - Raw body buffer or event payload object
+ * @param {string} secret         - The subscriber's shared secret
+ * @returns {string}              - Hex-encoded HMAC signature
  */
 const generateSignature = (payload, secret) => {
-  const body = JSON.stringify(payload)
+  const body = Buffer.isBuffer(payload)
+    ? payload
+    : Buffer.from(JSON.stringify(payload))
+
   return crypto
     .createHmac('sha256', secret)
     .update(body)
@@ -24,7 +31,7 @@ const generateSignature = (payload, secret) => {
  * where an attacker could guess the correct signature byte-by-byte
  * by measuring how long the comparison takes.
  *
- * @param {object} payload           - The received payload
+ * @param {Buffer|object} payload    - Raw body buffer or received payload object
  * @param {string} secret            - The subscriber's shared secret
  * @param {string} receivedSignature - Signature from X-Webhook-Signature header
  * @returns {boolean}

@@ -1,7 +1,12 @@
 const axios = require('axios')
 
 const BASE_URL = 'http://localhost:3000'
-const SHARED_SECRET = 'my-super-secret-key'
+const DELIVERY_WAIT_MS = Number(process.env.DELIVERY_WAIT_MS) || 20000
+
+const SHARED_SECRET = process.env.WEBHOOK_SECRET
+if (!SHARED_SECRET) {
+  throw new Error('WEBHOOK_SECRET env variable is required. Copy .env.example to .env and set it.')
+}
 
 // Step 1: Register a subscriber (run once, then comment out)
 const registerSubscriber = async () => {
@@ -59,8 +64,8 @@ const run = async () => {
     })
 
     // Wait for deliveries to process, then check logs
-    console.log('\n--- Waiting 5s for deliveries to process ---')
-    await new Promise(r => setTimeout(r, 5000))
+    console.log(`\n--- Waiting ${Math.round(DELIVERY_WAIT_MS / 1000)}s for deliveries to process ---`)
+    await new Promise(r => setTimeout(r, DELIVERY_WAIT_MS))
 
     console.log('\n--- Delivery Logs ---')
     await checkLogs(subscriberId)

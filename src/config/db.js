@@ -3,7 +3,8 @@ const logger = require('./logger')
  
 const connectDB = async () => {
   try {
-    await mongoose.connect(process.env.MONGODB_URI)
+    const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/webhook-delivery'
+    await mongoose.connect(mongoUri)
     logger.info('MongoDB connected')
   } catch (err) {
     logger.error('MongoDB connection failed', { error: err.message })

@@ -15,11 +15,14 @@ const deliveryQueue = new Queue('webhook-delivery', {
   }
 })
 
-// Dead letter queue — permanently failed deliveries land here
+// Dead letter queue — permanently failed deliveries land here.
+// removeOnFail is set so that jobs that fail inside the DLQ itself
+// (rare but possible) do not accumulate in Redis indefinitely.
 const deadLetterQueue = new Queue('webhook-dead-letter', {
   connection: redisConnection,
   defaultJobOptions: {
-    removeOnComplete: 500
+    removeOnComplete: 500,
+    removeOnFail: 200
   }
 })
 

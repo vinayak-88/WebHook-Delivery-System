@@ -1,11 +1,21 @@
 const express = require('express')
-const { verifySignature } = require('../src/utils/hmac')
+const { verifySignature } = require('../utils/hmac')
 
 const app = express()
-app.use(express.json())
+
+// Capture raw body bytes so signature verification operates on the exact
+// bytes that were signed — not a re-serialised parsed object
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf
+  }
+}))
 
 // The secret must match what you registered with
-const SHARED_SECRET = 'my-super-secret-key'
+const SHARED_SECRET = process.env.WEBHOOK_SECRET
+if (!SHARED_SECRET) {
+  throw new Error('WEBHOOK_SECRET env variable is required. Copy .env.example to .env and set it.')
+}
 
 let requestCount = 0
 
@@ -19,8 +29,8 @@ app.post('/receive', (req, res) => {
   console.log(`  Attempt:   `, attemptNumber)
   console.log(`  Signature: `, signature)
 
-  // Verify the signature — reject if invalid
-  const isValid = verifySignature(req.body, SHARED_SECRET, signature)
+  // Verify against raw body bytes — same bytes the worker signed
+  const isValid = verifySignature(req.rawBody, SHARED_SECRET, signature)
   if (!isValid) {
     console.log(`  ❌ Signature verification FAILED`)
     return res.status(401).json({ error: 'Invalid signature' })
