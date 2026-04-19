@@ -28,6 +28,20 @@ router.post('/register', async (req, res) => {
     })
   }
 
+  // Gap fix: validate every event type string in the array against the same
+  // "noun.verb" convention enforced on the producer side in events.js.
+  // Without this, a subscriber can register with "PAYMENT_SUCCESS" or ""
+  // and silently never receive any deliveries because the string will never
+  // match a fired event type.
+  const EVENT_TYPE_RE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/
+  const invalidEvents = events.filter(e => typeof e !== 'string' || !EVENT_TYPE_RE.test(e.trim()))
+  if (invalidEvents.length > 0) {
+    return res.status(400).json({
+      error: 'Each event type must follow the "noun.verb" format (e.g. "payment.success")',
+      invalid: invalidEvents
+    })
+  }
+
   // Gap fix: enforce minimum secret length
   if (typeof secret !== 'string' || secret.length < SECRET_MIN_LENGTH) {
     return res.status(400).json({
@@ -36,7 +50,17 @@ router.post('/register', async (req, res) => {
   }
 
   try {
-    new URL(subscriberUrl)
+    const parsed = new URL(subscriberUrl)
+    // Gap fix: enforce HTTPS. Allowing HTTP means webhook payloads and
+    // HMAC signatures travel in plaintext — an attacker on the same network
+    // can intercept both, breaking the security guarantee HMAC provides.
+    // Allow HTTP only in non-production environments (local dev / testing).
+    if (parsed.protocol !== 'https:' && process.env.NODE_ENV === 'production') {
+      return res.status(400).json({ error: 'subscriberUrl must use HTTPS in production' })
+    }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return res.status(400).json({ error: 'subscriberUrl must be a valid HTTP or HTTPS URL' })
+    }
   } catch {
     return res.status(400).json({ error: 'subscriberUrl must be a valid URL' })
   }

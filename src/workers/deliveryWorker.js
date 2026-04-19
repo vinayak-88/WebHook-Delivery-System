@@ -77,11 +77,14 @@ const processDeliveryJob = async (job) => {
   }
 
   // Sign the exact bytes that will be sent over the wire.
+  // bodyBuffer is passed directly to axios so the signed bytes and the
+  // wire bytes are the same buffer — eliminates the implicit double-stringify
+  // that occurred when axios.post received a plain object and re-serialised it.
   const bodyBuffer = Buffer.from(JSON.stringify(payload))
   const signature = generateSignature(bodyBuffer, subscriber.signingKey)
 
   try {
-    const response = await axios.post(subscriberUrl, payload, {
+    const response = await axios.post(subscriberUrl, bodyBuffer, {
       headers: {
         'Content-Type': 'application/json',
         'X-Webhook-Signature': signature,
