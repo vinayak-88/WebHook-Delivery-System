@@ -9,6 +9,13 @@ const Subscriber = require('../models/subscriber')
 const { deadLetterQueue } = require('../queues/deliveryQueue')
 const { generateSignature } = require('../utils/hmac')
 
+// Bug fix: import the queue config constant so maxAttempts is always in
+// sync with deliveryQueue.js. Previously the worker used
+// job.opts?.attempts ?? 5 — but BullMQ does not copy defaultJobOptions
+// into individual job.opts, so job.opts.attempts is always undefined and
+// the fallback of 5 was correct only by coincidence.
+const { MAX_DELIVERY_ATTEMPTS } = require('../queues/deliveryQueue')
+
 const buildLogPayload = ({
   eventId,
   subscriberId,
@@ -48,8 +55,6 @@ const persistDeliveryLog = async (logPayload, { rethrowOnFailure = false } = {})
 }
 
 const processDeliveryJob = async (job) => {
-  // Secret is intentionally NOT stored in job.data or the Event document.
-  // Fetch it fresh from the Subscriber collection at delivery time.
   const { eventId, subscriberId, subscriberUrl, payload } = job.data
   const attemptNumber = job.attemptsMade + 1
 
@@ -59,17 +64,21 @@ const processDeliveryJob = async (job) => {
     eventId
   })
 
-  const subscriber = await Subscriber.findById(subscriberId).select('secretHash')
+  // Bug fix: fetch signingKey, not secretHash.
+  // secretHash is a bcrypt hash — it cannot be used as an HMAC key because
+  // the subscriber has the plaintext and derives the same key independently.
+  // signingKey is a deterministic HKDF-SHA256 derivative of the plaintext
+  // stored on the Subscriber document, so the worker never needs the
+  // plaintext itself while still producing a verifiable signature.
+  const subscriber = await Subscriber.findById(subscriberId).select('signingKey')
   if (!subscriber) {
     // Subscriber was hard-deleted — nothing to deliver to, fail permanently
     throw new Error(`Subscriber ${subscriberId} not found — cannot sign delivery`)
   }
 
   // Sign the exact bytes that will be sent over the wire.
-  // Using a Buffer from JSON.stringify ensures the same byte sequence
-  // is signed and can be independently verified by the subscriber.
   const bodyBuffer = Buffer.from(JSON.stringify(payload))
-  const signature = generateSignature(bodyBuffer, subscriber.secretHash)
+  const signature = generateSignature(bodyBuffer, subscriber.signingKey)
 
   try {
     const response = await axios.post(subscriberUrl, payload, {
@@ -144,11 +153,10 @@ deliveryWorker.on('failed', async (job, err) => {
     return
   }
 
-  // job.opts.attempts may be undefined in some BullMQ versions if
-  // defaultJobOptions are not merged into job.opts — fall back to 5
-  const maxAttempts = job.opts?.attempts ?? 5
-
-  if (job.attemptsMade >= maxAttempts) {
+  // Bug fix: use the exported constant from deliveryQueue.js instead of
+  // job.opts?.attempts. BullMQ does not propagate defaultJobOptions into
+  // job.opts, so job.opts.attempts is always undefined at runtime.
+  if (job.attemptsMade >= MAX_DELIVERY_ATTEMPTS) {
     logger.error(`Job ${job.id} permanently failed — moving to dead letter queue`, {
       subscriberUrl: job.data.subscriberUrl,
       eventId: job.data.eventId,
@@ -182,8 +190,6 @@ deliveryWorker.on('error', (err) => {
 })
 
 // Graceful shutdown — wait for active jobs to finish before exiting.
-// Without this, Docker/OS SIGTERM would interrupt in-flight deliveries,
-// causing BullMQ to re-enqueue them and potentially deliver twice.
 const shutdown = async (signal) => {
   logger.info(`Received ${signal} — closing worker gracefully`)
   try {

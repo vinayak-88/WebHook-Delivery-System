@@ -1,11 +1,17 @@
 const { Queue } = require('bullmq')
 const redisConnection = require('../config/redis')
 
+// Single source of truth for max attempts.
+// Exported so deliveryWorker.js can read the same value instead of
+// relying on job.opts.attempts, which BullMQ does not populate from
+// defaultJobOptions at the individual job level.
+const MAX_DELIVERY_ATTEMPTS = 5
+
 // Main delivery queue — jobs flow through here to the worker
 const deliveryQueue = new Queue('webhook-delivery', {
   connection: redisConnection,
   defaultJobOptions: {
-    attempts: 5,
+    attempts: MAX_DELIVERY_ATTEMPTS,
     backoff: {
       type: 'exponential',
       delay: 1000           // 1s → 2s → 4s → 8s → 16s
@@ -16,8 +22,6 @@ const deliveryQueue = new Queue('webhook-delivery', {
 })
 
 // Dead letter queue — permanently failed deliveries land here.
-// removeOnFail is set so that jobs that fail inside the DLQ itself
-// (rare but possible) do not accumulate in Redis indefinitely.
 const deadLetterQueue = new Queue('webhook-dead-letter', {
   connection: redisConnection,
   defaultJobOptions: {
@@ -26,4 +30,4 @@ const deadLetterQueue = new Queue('webhook-dead-letter', {
   }
 })
 
-module.exports = { deliveryQueue, deadLetterQueue }
+module.exports = { deliveryQueue, deadLetterQueue, MAX_DELIVERY_ATTEMPTS }

@@ -1,8 +1,15 @@
 const express = require('express')
 const router = express.Router()
-const Subscriber = require('../models/subscriber')
-const DeliveryLog = require('../models/deliveryLog')
+
+// Bug fix: PascalCase imports to match actual filenames on Linux filesystems
+const Subscriber = require('../models/Subscriber')
+const DeliveryLog = require('../models/DeliveryLog')
 const logger = require('../config/logger')
+
+// Gap fix: minimum secret length for meaningful HMAC security.
+// HMAC-SHA256 has a 64-byte block size. Secrets shorter than 32 chars
+// are trivially brute-forceable — enforce a floor.
+const SECRET_MIN_LENGTH = 32
 
 // POST /webhooks/register
 // Register a new subscriber
@@ -18,6 +25,13 @@ router.post('/register', async (req, res) => {
   if (!Array.isArray(events) || events.length === 0) {
     return res.status(400).json({
       error: 'events must be a non-empty array'
+    })
+  }
+
+  // Gap fix: enforce minimum secret length
+  if (typeof secret !== 'string' || secret.length < SECRET_MIN_LENGTH) {
+    return res.status(400).json({
+      error: `secret must be at least ${SECRET_MIN_LENGTH} characters`
     })
   }
 

@@ -1,7 +1,12 @@
 const express = require('express')
 const router = express.Router()
-const Event = require('../models/event')
-const Subscriber = require('../models/subscriber')
+
+// Bug fix: import paths must match the actual filename casing exactly.
+// On Linux (Docker/CI), the filesystem is case-sensitive. Event.js and
+// Subscriber.js are PascalCase — lowercase imports fail at runtime with
+// MODULE_NOT_FOUND even though they appear to work on macOS.
+const Event = require('../models/Event')
+const Subscriber = require('../models/Subscriber')
 const logger = require('../config/logger')
 const { queueEventDeliveries } = require('../utils/eventQueue')
 
@@ -12,6 +17,16 @@ router.post('/', async (req, res) => {
 
   if (typeof type !== 'string' || !type.trim() || payload === undefined) {
     return res.status(400).json({ error: 'type and payload are required' })
+  }
+
+  // Gap fix: validate event type format — must follow "noun.verb" convention
+  // to prevent typo mismatches between producers and subscribers.
+  // e.g. "payment.success" is valid, "paymentsuccess" or "PAYMENT_SUCCESS" are not.
+  const EVENT_TYPE_RE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/
+  if (!EVENT_TYPE_RE.test(type.trim())) {
+    return res.status(400).json({
+      error: 'type must follow the "noun.verb" format (e.g. "payment.success")'
+    })
   }
 
   try {
@@ -25,10 +40,14 @@ router.post('/', async (req, res) => {
     const event = await Event.create({
       type,
       payload,
+      // Bug fix: removed `secret: subscriber.secret` which was always
+      // undefined — `secret` is a virtual setter on the Subscriber schema,
+      // not a stored field, so reading it back from a saved document returns
+      // undefined. The Event.deliveryTargets schema has no secret field by
+      // design (worker fetches it from the Subscriber at delivery time).
       deliveryTargets: subscribers.map((subscriber) => ({
         subscriberId: subscriber._id,
-        subscriberUrl: subscriber.subscriberUrl,
-        secret: subscriber.secret
+        subscriberUrl: subscriber.subscriberUrl
       }))
     })
 

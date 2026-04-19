@@ -1,3 +1,4 @@
+const crypto = require('crypto')
 const { generateSignature, verifySignature } = require('../utils/hmac')
 
 jest.mock('axios')
@@ -16,7 +17,18 @@ const DeliveryLog = require('../models/deliveryLog')
 const Subscriber = require('../models/subscriber')
 const { processDeliveryJob } = require('../workers/deliveryWorker')
 
-// Helper — builds a minimal BullMQ-shaped job object
+// Derive signing key exactly as Subscriber.js pre-save does.
+// The mock must return a signingKey (not secretHash) to match
+// what the fixed worker now fetches.
+const TEST_PLAINTEXT_SECRET = 'test-secret-long-enough-to-pass-minimum-length-validation'
+const TEST_SIGNING_KEY = crypto.hkdfSync(
+  'sha256',
+  Buffer.from(TEST_PLAINTEXT_SECRET),
+  Buffer.alloc(0),
+  Buffer.from('webhook-signing-v1'),
+  32
+).toString('hex')
+
 const makeJob = (overrides = {}) => ({
   id: 'job-test-1',
   attemptsMade: 0,
@@ -30,30 +42,40 @@ const makeJob = (overrides = {}) => ({
   ...overrides
 })
 
-// Stub Subscriber.findById to return a secretHash by default
+// Bug fix: mock now returns signingKey, not secretHash.
+// The worker calls Subscriber.findById(id).select('signingKey'),
+// so the mock must reflect the corrected field name.
 beforeEach(() => {
   jest.clearAllMocks()
   Subscriber.findById.mockReturnValue({
-    select: jest.fn().mockResolvedValue({ secretHash: 'test-secret-hash' })
+    select: jest.fn().mockResolvedValue({ signingKey: TEST_SIGNING_KEY })
   })
 })
 
 // --- HMAC integration ---
 describe('Delivery Signature Behaviour', () => {
-  const secret = 'sub-secret'
-  const payload = { orderId: 'ORD-999', amount: 500 }
-
-  it('signed payload produces a verifiable signature on subscriber side', () => {
+  it('signingKey-signed payload produces a verifiable signature on subscriber side', () => {
+    const payload = { orderId: 'ORD-999', amount: 500 }
     const bodyBuffer = Buffer.from(JSON.stringify(payload))
-    const signature = generateSignature(bodyBuffer, secret)
-    expect(verifySignature(bodyBuffer, secret, signature)).toBe(true)
+    const signature = generateSignature(bodyBuffer, TEST_SIGNING_KEY)
+    expect(verifySignature(bodyBuffer, TEST_SIGNING_KEY, signature)).toBe(true)
   })
 
   it('subscriber rejects a delivery where payload was modified in transit', () => {
+    const payload = { orderId: 'ORD-999', amount: 500 }
     const bodyBuffer = Buffer.from(JSON.stringify(payload))
-    const signature = generateSignature(bodyBuffer, secret)
+    const signature = generateSignature(bodyBuffer, TEST_SIGNING_KEY)
     const modifiedBuffer = Buffer.from(JSON.stringify({ ...payload, amount: 99999 }))
-    expect(verifySignature(modifiedBuffer, secret, signature)).toBe(false)
+    expect(verifySignature(modifiedBuffer, TEST_SIGNING_KEY, signature)).toBe(false)
+  })
+
+  it('raw plaintext secret does not verify a signingKey-signed payload', () => {
+    // Regression: verifying with plaintext must fail when signed with signingKey.
+    // This is the test that would have caught the original bug.
+    const payload = { orderId: 'ORD-999', amount: 500 }
+    const bodyBuffer = Buffer.from(JSON.stringify(payload))
+    const signature = generateSignature(bodyBuffer, TEST_SIGNING_KEY)
+    expect(verifySignature(bodyBuffer, TEST_PLAINTEXT_SECRET, signature)).toBe(false)
   })
 })
 
@@ -103,7 +125,6 @@ describe('Delivery Retry Behaviour', () => {
       'Subscriber sub-1 not found'
     )
 
-    // No delivery attempt should be made
     expect(axios.post).not.toHaveBeenCalled()
     expect(DeliveryLog.create).not.toHaveBeenCalled()
   })
@@ -121,10 +142,10 @@ describe('Delivery Retry Behaviour', () => {
 
     jest.clearAllMocks()
     Subscriber.findById.mockReturnValue({
-      select: jest.fn().mockResolvedValue({ secretHash: 'test-secret-hash' })
+      select: jest.fn().mockResolvedValue({ signingKey: TEST_SIGNING_KEY })
     })
 
-    // Attempt 2 — succeeds (BullMQ increments attemptsMade before retry)
+    // Attempt 2 — succeeds
     axios.post.mockResolvedValueOnce({ status: 200, data: { received: true } })
     await processDeliveryJob(makeJob({ attemptsMade: 1 }))
     expect(DeliveryLog.create).toHaveBeenCalledWith(
