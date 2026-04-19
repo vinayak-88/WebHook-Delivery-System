@@ -36,7 +36,7 @@ POST /events ──► [Express API] ──► [BullMQ Queue] ──► [Deliver
 Delivery is asynchronous — the API queues the job and returns immediately without waiting for the subscriber to respond. Returning 200 would imply the delivery already succeeded, which is false. 202 accurately signals "received and queued, not yet delivered."
 
 ### Why exponential backoff instead of fixed-interval retry?
-Fixed-interval retry (every 5 seconds regardless) causes a thundering herd problem — if a subscriber goes down and 10,000 events are queued, all 10,000 hammer the subscriber the moment it comes back up, likely taking it down again. Exponential backoff (1s → 2s → 4s → 8s → 16s) spreads the load and gives the subscriber time to recover.
+Fixed-interval retry (every 5 seconds regardless) causes a thundering herd problem — if a subscriber goes down and 10,000 events are queued, all 10,000 hammer the subscriber the moment it comes back up, likely taking it down again. Exponential backoff (1s → 2s → 4s → 8s) spreads the load and gives the subscriber time to recover.
 
 ### Why HMAC-SHA256 for payload signing?
 When the worker delivers to a subscriber URL, the subscriber has no way to know if the request genuinely came from this server or from an attacker who discovered their endpoint. HMAC solves this: both parties share a secret at registration time, and every delivery is signed with it. The subscriber recomputes the hash and compares — if they match, the request is authentic.
@@ -149,12 +149,32 @@ X-Webhook-Attempt: <attemptNumber>
 ### Verifying the signature on your end (Node.js example)
 ```javascript
 const crypto = require('crypto')
+const express = require('express')
+const app = express()
+
+// Capture raw body bytes before JSON parsing.
+// Verification must run against the exact bytes received over the wire —
+// not a re-serialised object, which can differ in property order.
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf }
+}))
+
+// Derive the signing key from your plaintext secret using the same
+// HKDF-SHA256 parameters the server uses. Both sides derive the same
+// key independently — the raw secret is never transmitted.
+const signingKey = crypto.hkdfSync(
+  'sha256',
+  Buffer.from(YOUR_PLAINTEXT_SECRET),
+  Buffer.alloc(0),
+  Buffer.from('webhook-signing-v1'),
+  32
+).toString('hex')
 
 app.post('/webhook', (req, res) => {
   const received = req.headers['x-webhook-signature']
   const expected = crypto
-    .createHmac('sha256', YOUR_SECRET)
-    .update(JSON.stringify(req.body))
+    .createHmac('sha256', signingKey)
+    .update(req.rawBody)             // raw wire bytes — not JSON.stringify(req.body)
     .digest('hex')
 
   const isValid = crypto.timingSafeEqual(
