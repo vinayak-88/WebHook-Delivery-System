@@ -1,5 +1,5 @@
-const Event = require('../models/event')
-const Subscriber = require('../models/subscriber')
+const Event = require('../models/Event')
+const Subscriber = require('../models/Subscriber')
 const { deliveryQueue } = require('../queues/deliveryQueue')
 const logger = require('../config/logger')
 

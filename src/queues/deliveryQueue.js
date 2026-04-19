@@ -14,7 +14,7 @@ const deliveryQueue = new Queue('webhook-delivery', {
     attempts: MAX_DELIVERY_ATTEMPTS,
     backoff: {
       type: 'exponential',
-      delay: 1000           // 1s → 2s → 4s → 8s → 16s
+      delay: 1000           // 1s → 2s → 4s → 8s
     },
     removeOnComplete: 100,  // keep last 100 completed jobs
     removeOnFail: 200       // keep last 200 failed jobs
