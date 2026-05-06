@@ -17,7 +17,7 @@ const app = express()
 app.use(express.json({
   verify: (req, res, buf) => {
     req.rawBody = buf
-  }
+  }, limit : "16kb"
 }))
 
 // Rate limiting — tighter on event ingestion, looser on management routes

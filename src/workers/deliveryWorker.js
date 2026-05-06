@@ -155,7 +155,7 @@ const processDeliveryJob = async (job) => {
 
 const deliveryWorker = new Worker("webhook-delivery", processDeliveryJob, {
   connection: redisConnection,
-  concurrency: 5,
+  concurrency: process.env.WORKER_CONCURRENCY || 5,
 });
 
 deliveryWorker.on("failed", async (job, err) => {
