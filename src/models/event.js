@@ -34,6 +34,13 @@ const eventSchema = new mongoose.Schema(
     deliveryTargets: {
       type: [deliveryTargetSchema],
       default: [],
+      validate:{
+        validator : function (arr){
+          const ids = arr.map(t => t.subscriberId.toString());
+            return new Set(ids).size === ids.length;
+          }, 
+          message : "deliveryTargets contains duplicate subscriberIds"
+      }
     },
     queueStatus: {
       type: String,
