@@ -41,7 +41,6 @@ const queueEventDeliveries = async (event) => {
     await markEventQueueState(event._id, {
       queueStatus: NO_SUBSCRIBERS_QUEUE_STATUS,
       queuedJobCount: 0,
-      queueEnqueuedAt: new Date(),
       lastQueueError: null,
     });
 
@@ -57,6 +56,7 @@ const queueEventDeliveries = async (event) => {
     await markEventQueueState(event._id, {
       queueStatus: QUEUED_QUEUE_STATUS,
       queuedJobCount: jobs.length,
+      queueEnqueuedAt: new Date(),
       lastQueueError: null,
     });
 
