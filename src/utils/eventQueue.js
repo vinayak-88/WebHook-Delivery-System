@@ -1,5 +1,4 @@
 const Event = require("../models/Event");
-const Subscriber = require("../models/Subscriber");
 const { deliveryQueue } = require("../queues/deliveryQueue");
 const logger = require("../config/logger");
 
@@ -13,7 +12,7 @@ const buildJobId = (eventId, subscriberId) =>
   `event:${eventId}:subscriber:${subscriberId}`;
 
 const buildDeliveryJobs = (event) =>
-  getDeliveryTargets(event).map((target) => ({
+  event.deliveryTargets.map((target) => ({
     name: "deliver",
     data: {
       eventId: event._id.toString(),
@@ -58,7 +57,6 @@ const queueEventDeliveries = async (event) => {
     await markEventQueueState(event._id, {
       queueStatus: QUEUED_QUEUE_STATUS,
       queuedJobCount: jobs.length,
-      queueEnqueuedAt: new Date(),
       lastQueueError: null,
     });
 
