@@ -15,7 +15,7 @@ const { queueEventDeliveries } = require('../utils/eventQueue')
 router.post('/', async (req, res) => {
   const { type, payload } = req.body
 
-  if (typeof type !== 'string' || !type.trim() || payload === undefined) {
+  if (typeof type !== 'string' || !type.trim() || payload === undefined || payload === null) {
     return res.status(400).json({ error: 'type and payload are required' })
   }
 
