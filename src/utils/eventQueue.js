@@ -6,8 +6,6 @@ const PENDING_QUEUE_STATUS = "pending";
 const QUEUED_QUEUE_STATUS = "queued";
 const NO_SUBSCRIBERS_QUEUE_STATUS = "no_subscribers";
 
-const getDeliveryTargets = (event) => event.deliveryTargets || [];
-
 const buildJobId = (eventId, subscriberId) =>
   `event:${eventId}:subscriber:${subscriberId}`;
 
@@ -30,18 +28,12 @@ const markEventQueueState = async (eventId, updates) =>
   Event.findByIdAndUpdate(eventId, updates, { new: true });
 
 const queueEventDeliveries = async (event) => {
-  let deliveryTargets = getDeliveryTargets(event);
-
-  const jobs = buildDeliveryJobs({
-    ...event,
-    deliveryTargets,
-  });
+  const jobs = buildDeliveryJobs(event);
 
   if (jobs.length === 0) {
     await markEventQueueState(event._id, {
       queueStatus: NO_SUBSCRIBERS_QUEUE_STATUS,
       queuedJobCount: 0,
-      lastQueueError: null,
     });
 
     return {
@@ -57,7 +49,7 @@ const queueEventDeliveries = async (event) => {
       queueStatus: QUEUED_QUEUE_STATUS,
       queuedJobCount: jobs.length,
       queueEnqueuedAt: new Date(),
-      lastQueueError: null,
+      lastQueueError: { message: null, code: null, occurredAt: null },
     });
 
     return {
@@ -67,7 +59,11 @@ const queueEventDeliveries = async (event) => {
   } catch (err) {
     await markEventQueueState(event._id, {
       queueStatus: PENDING_QUEUE_STATUS,
-      lastQueueError: err.message,
+      lastQueueError: {
+        message: err.message,
+        code: err.code || null,
+        occurredAt: new Date(),
+      },
     });
 
     throw err;

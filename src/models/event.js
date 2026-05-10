@@ -34,13 +34,13 @@ const eventSchema = new mongoose.Schema(
     deliveryTargets: {
       type: [deliveryTargetSchema],
       default: [],
-      validate:{
-        validator : function (arr){
-          const ids = arr.map(t => t.subscriberId.toString());
-            return new Set(ids).size === ids.length;
-          }, 
-          message : "deliveryTargets contains duplicate subscriberIds"
-      }
+      validate: {
+        validator: function (arr) {
+          const ids = arr.map((t) => t.subscriberId.toString());
+          return new Set(ids).size === ids.length;
+        },
+        message: "deliveryTargets contains duplicate subscriberIds",
+      },
     },
     queueStatus: {
       type: String,
@@ -58,13 +58,11 @@ const eventSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
-    queueErrors: [
-      {
-        message: String,
-        subscriberId: mongoose.Schema.Types.ObjectId,
-        occurredAt: Date,
-      },
-    ],
+    lastQueueError: {
+      message: { type: String, default: null },
+      code: { type: String, default: null }, // e.g. ECONNREFUSED, ETIMEDOUT
+      occurredAt: { type: Date, default: null },
+    },
   },
   { timestamps: true },
 );
