@@ -8,12 +8,25 @@ const subscriberSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
-      unique: true
+      unique: true,
     },
     events: {
       type: [String],
       required: true,
-      validate: (v) => Array.isArray(v) && v.length > 0,
+      validate: [
+        {
+          validator: function (arr) {
+            return arr.length > 0;
+          },
+          message: "events array must not be empty",
+        },
+        {
+          validator: function (arr) {
+            return new Set(arr).size === arr.length;
+          },
+          message: "events array must not contain duplicates",
+        },
+      ],
     },
     signingKey: {
       type: String,
@@ -30,7 +43,7 @@ const subscriberSchema = new mongoose.Schema(
 // Compound unique index — prevents duplicate registrations
 // for the same URL + event combination
 // subscriberSchema.index({ subscriberUrl: 1, events: 1 }, { unique: true });
-subscriberSchema.index({events : 1})
+subscriberSchema.index({ events: 1 });
 
 // Virtual setter so calling code can still write subscriber.secret = '...'
 // and it gets hashed transparently via the pre-save hook
