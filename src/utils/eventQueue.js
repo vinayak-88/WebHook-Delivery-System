@@ -72,7 +72,7 @@ const queueEventDeliveries = async (event) => {
 
 const recoverPendingEvents = async ({ limit = 25 } = {}) => {
   const pendingEvents = await Event.find({ queueStatus: PENDING_QUEUE_STATUS })
-    .sort({ createdAt: 1 })
+    .sort({ createdAt: 1 }) //ascending order
     .limit(limit);
 
   let recovered = 0;
@@ -132,6 +132,8 @@ const startPendingEventRecovery = ({
 
       if (result.recovered > 0) {
         logger.info("Recovered pending events into the delivery queue", result);
+      } else if (result.scanned > 0) {
+        logger.warn("Pending events found but none could be recovered", result);
       }
     } catch (err) {
       logger.error("Pending event recovery failed", {
@@ -146,10 +148,6 @@ const startPendingEventRecovery = ({
   const timer = setInterval(() => {
     void runRecovery();
   }, intervalMs);
-
-  if (typeof timer.unref === "function") {
-    timer.unref();
-  }
 
   void runRecovery();
 
