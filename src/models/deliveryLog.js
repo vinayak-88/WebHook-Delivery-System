@@ -33,7 +33,7 @@ const deliveryLogSchema = new mongoose.Schema({
   },
   errorMessage: {
     type: String,
-    default: null     // populated on network-level failures
+    default: null    
   }
 }, { timestamps: true })
  
