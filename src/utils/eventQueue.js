@@ -102,14 +102,6 @@ const startPendingEventRecovery = ({
   if (intervalMs <= 0) {
     return null;
   }
-
-  // Safety valve: set DISABLE_RECOVERY=true when running multiple API
-  // instances to prevent concurrent recovery scans until a distributed
-  // lock (e.g. Redlock) is in place. Without this, two instances can
-  // both pick up the same pending event and enqueue duplicate delivery jobs.
-  // BullMQ's deterministic jobId (event:X:subscriber:Y) provides a last-line
-  // defence — duplicate addBulk calls for the same jobId are silently ignored
-  // by Redis — but relying on that alone is fragile under load.
   if (process.env.DISABLE_RECOVERY === "true") {
     logger.warn(
       "Pending event recovery is disabled via DISABLE_RECOVERY=true. " +

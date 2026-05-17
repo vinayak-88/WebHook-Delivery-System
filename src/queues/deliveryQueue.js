@@ -1,10 +1,5 @@
 const { Queue } = require('bullmq')
 const redisConnection = require('../config/redis')
-
-// Single source of truth for max attempts.
-// Exported so deliveryWorker.js can read the same value instead of
-// relying on job.opts.attempts, which BullMQ does not populate from
-// defaultJobOptions at the individual job level.
 const MAX_DELIVERY_ATTEMPTS = 5
 
 // Main delivery queue — jobs flow through here to the worker

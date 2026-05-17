@@ -1,5 +1,6 @@
 require("dotenv").config();
 const express = require("express");
+const mongoose = require("mongoose");
 const rateLimit = require("express-rate-limit");
 const connectDB = require("./config/db");
 const logger = require("./config/logger");
@@ -7,6 +8,7 @@ const webhookRoutes = require("./routes/webhooks");
 const eventRoutes = require("./routes/events");
 const deadLetterRoutes = require("./routes/deadLetters");
 const { startPendingEventRecovery } = require("./utils/eventQueue");
+const { deliveryQueue } = require("./queues/deliveryQueue");
 
 const app = express();
 
@@ -60,7 +62,7 @@ const PORT = process.env.PORT || 3000;
 const startServer = async () => {
   await connectDB();
 
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     logger.info(`Server started on port ${PORT}`);
     // Start recovery only inside the listen callback — guarantees the DB
     // connection pool is fully warmed before the first recovery tick runs
