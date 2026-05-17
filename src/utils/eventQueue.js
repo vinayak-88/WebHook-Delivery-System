@@ -102,6 +102,10 @@ const startPendingEventRecovery = ({
   if (intervalMs <= 0) {
     return null;
   }
+
+  //to prevent multiple instances of the server from running the recovery process 
+  // i.e. setInterval will only be triggered by one first instance only when multiple instances are running to avoid duplicate deliveries
+
   if (process.env.DISABLE_RECOVERY === "true") {
     logger.warn(
       "Pending event recovery is disabled via DISABLE_RECOVERY=true. " +
