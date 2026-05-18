@@ -84,10 +84,10 @@ router.post('/register', async (req, res) => {
     })
 
   } catch (err) {
-    // Duplicate subscriberUrl + events combination
+    // Duplicate subscriberUrl
     if (err.code === 11000) {
       return res.status(409).json({
-        error: 'A subscriber with this URL and event combination already exists'
+        error: 'A subscriber with this URL already exists'
       })
     }
     logger.error('Failed to register subscriber', { error: err.message })
