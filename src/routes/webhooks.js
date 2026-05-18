@@ -1,14 +1,11 @@
 const express = require('express')
 const router = express.Router()
 
-// Bug fix: PascalCase imports to match actual filenames on Linux filesystems
 const Subscriber = require('../models/Subscriber')
 const DeliveryLog = require('../models/DeliveryLog')
 const logger = require('../config/logger')
 
-// Gap fix: minimum secret length for meaningful HMAC security.
-// HMAC-SHA256 has a 64-byte block size. Secrets shorter than 32 chars
-// are trivially brute-forceable — enforce a floor.
+//Secrets shorter than 32 chars are trivially brute-forceable
 const SECRET_MIN_LENGTH = 32
 
 // POST /webhooks/register
@@ -16,7 +13,7 @@ const SECRET_MIN_LENGTH = 32
 router.post('/register', async (req, res) => {
   const { subscriberUrl, events, secret } = req.body
 
-  if (!subscriberUrl || !events || !secret) {
+  if (!subscriberUrl.trim() || !events || !secret) {
     return res.status(400).json({
       error: 'subscriberUrl, events, and secret are required'
     })
@@ -27,12 +24,8 @@ router.post('/register', async (req, res) => {
       error: 'events must be a non-empty array'
     })
   }
-
-  // Gap fix: validate every event type string in the array against the same
-  // "noun.verb" convention enforced on the producer side in events.js.
-  // Without this, a subscriber can register with "PAYMENT_SUCCESS" or ""
-  // and silently never receive any deliveries because the string will never
-  // match a fired event type.
+  
+  //only a certain type of event nomenclature is allowed : payment.success(example)
   const EVENT_TYPE_RE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/
   const invalidEvents = events.filter(e => typeof e !== 'string' || !EVENT_TYPE_RE.test(e.trim()))
   if (invalidEvents.length > 0) {
@@ -42,8 +35,14 @@ router.post('/register', async (req, res) => {
     })
   }
 
-  // Gap fix: enforce minimum secret length
-  if (typeof secret !== 'string' || secret.length < SECRET_MIN_LENGTH) {
+  if(typeof secret !== 'string'){
+    return res.status(400).json({
+      error:'secret must be of type string'
+    })
+  }
+
+  //minimum secret length check
+  if (secret.length < SECRET_MIN_LENGTH) {
     return res.status(400).json({
       error: `secret must be at least ${SECRET_MIN_LENGTH} characters`
     })

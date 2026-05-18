@@ -4,30 +4,17 @@ const { verifySignature } = require('../utils/hmac')
 
 const app = express()
 
-// Capture raw body bytes so signature verification operates on the exact
-// bytes that were signed — not a re-serialised parsed object
+// Capture raw body bytes so signature verification operates on the exact bytes that were signed — not a re-serialised parsed object
 app.use(express.json({
   verify: (req, res, buf) => {
     req.rawBody = buf
   }
 }))
 
-const SHARED_SECRET = process.env.WEBHOOK_SECRET
+const signingKey = process.env.WEBHOOK_SECRET
 if (!SHARED_SECRET) {
   throw new Error('WEBHOOK_SECRET env variable is required. Copy .env.example to .env and set it.')
 }
-
-// Bug fix: the worker signs with a signingKey derived via HKDF-SHA256,
-// not the raw SHARED_SECRET. The subscriber must derive the same key
-// using the same parameters so verifySignature gets matching inputs.
-// 'webhook-signing-v1' must match the info label used in Subscriber.js pre-save.
-const signingKey = crypto.hkdfSync(
-  'sha256',
-  Buffer.from(SHARED_SECRET),
-  Buffer.alloc(0),
-  Buffer.from('webhook-signing-v1'),
-  32
-).toString('hex')
 
 let requestCount = 0
 
