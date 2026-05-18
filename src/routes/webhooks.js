@@ -34,6 +34,8 @@ router.post('/register', async (req, res) => {
       invalid: invalidEvents
     })
   }
+  
+  events = events.trim();
 
   if(typeof secret !== 'string'){
     return res.status(400).json({
@@ -50,10 +52,7 @@ router.post('/register', async (req, res) => {
 
   try {
     const parsed = new URL(subscriberUrl)
-    // Gap fix: enforce HTTPS. Allowing HTTP means webhook payloads and
-    // HMAC signatures travel in plaintext — an attacker on the same network
-    // can intercept both, breaking the security guarantee HMAC provides.
-    // Allow HTTP only in non-production environments (local dev / testing).
+    //allow only https so that secrets are encrypted
     if (parsed.protocol !== 'https:' && process.env.NODE_ENV === 'production') {
       return res.status(400).json({ error: 'subscriberUrl must use HTTPS in production' })
     }
@@ -68,7 +67,7 @@ router.post('/register', async (req, res) => {
     const subscriber = await new Subscriber({
       subscriberUrl,
       events,
-      secret  // hits the virtual setter on the schema, gets hashed in pre-save
+      secret  // hits the virtual setter on the schema
     }).save()
 
     logger.info('Subscriber registered', {

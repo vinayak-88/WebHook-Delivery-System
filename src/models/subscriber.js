@@ -40,41 +40,10 @@ const subscriberSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
-// Compound unique index — prevents duplicate registrations
-// for the same URL + event combination
-// subscriberSchema.index({ subscriberUrl: 1, events: 1 }, { unique: true });
 subscriberSchema.index({ events: 1 });
 
-// Virtual setter so calling code can still write subscriber.secret = '...'
-// and it gets hashed transparently via the pre-save hook
 subscriberSchema.virtual("secret").set(function (val) {
-  this._plaintextSecret = val;
-  this.secretHash = val; // pre-save hook overwrites with bcrypt hash
-});
-
-subscriberSchema.pre("save", async function () {
-  // Only runs when the raw value was set via the virtual setter
-  if (!this._plaintextSecret) return;
-
-  // bcrypt hash — for secretHash field
-  this.secretHash = await bcrypt.hash(this._plaintextSecret, 12);
-
-  // HKDF-SHA256 — deterministic signing key derived from the plaintext.
-  // Using HKDF instead of a raw copy means the signingKey is
-  // cryptographically independent from the password-equivalent secretHash.
-  // 'webhook-signing-v1' is the info/context label; change it to rotate
-  // all signing keys without changing subscriber secrets.
-  this.signingKey = crypto
-    .hkdfSync(
-      "sha256",
-      Buffer.from(this._plaintextSecret),
-      Buffer.alloc(0), // salt (empty — secret itself is the IKM)
-      Buffer.from("webhook-signing-v1"),
-      32, // 32 bytes = 256-bit key, hex = 64 chars
-    )
-    .toString("hex");
-
-  delete this._plaintextSecret;
+  this.signingKey = val;
 });
 
 module.exports = mongoose.model("Subscriber", subscriberSchema);
