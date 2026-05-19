@@ -9,6 +9,7 @@ const eventRoutes = require("./routes/events");
 const deadLetterRoutes = require("./routes/deadLetters");
 const { startPendingEventRecovery } = require("./utils/eventQueue");
 const { deliveryQueue } = require("./queues/deliveryQueue");
+const producerRouter = require('./routes/producer')
 
 const app = express();
 
@@ -40,6 +41,7 @@ const managementLimiter = rateLimit({
 app.use("/events", eventLimiter, eventRoutes);
 app.use("/webhooks", managementLimiter, webhookRoutes);
 app.use("/dead-letters", managementLimiter, deadLetterRoutes);
+app.use("/producers", managementLimiter, producerRouter)
 
 // Health check
 app.get("/health", (req, res) => {

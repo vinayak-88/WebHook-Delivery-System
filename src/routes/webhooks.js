@@ -7,11 +7,12 @@ const logger = require('../config/logger')
 
 //Secrets shorter than 32 chars are trivially brute-forceable
 const SECRET_MIN_LENGTH = 32
+const EVENT_TYPE_RE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
 
 // POST /webhooks/register
 // Register a new subscriber
 router.post('/register', async (req, res) => {
-  const { subscriberUrl, events, secret } = req.body
+  let { subscriberUrl, events, secret } = req.body
 
   if (!subscriberUrl.trim() || !events || !secret) {
     return res.status(400).json({
@@ -26,7 +27,6 @@ router.post('/register', async (req, res) => {
   }
   
   //only a certain type of event nomenclature is allowed : payment.success(example)
-  const EVENT_TYPE_RE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/
   const invalidEvents = events.filter(e => typeof e !== 'string' || !EVENT_TYPE_RE.test(e.trim()))
   if (invalidEvents.length > 0) {
     return res.status(400).json({
