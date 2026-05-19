@@ -8,7 +8,7 @@ const authenticateProducer = require("../middlewares/authenticateProducer");
 
 // POST /events
 // Accept an incoming event, find matching subscribers, queue deliveries
-router.post("/",authenticateProducer, async (req, res) => {
+router.post("/", authenticateProducer, async (req, res) => {
   const { type, payload } = req.body;
 
   if (
@@ -24,6 +24,13 @@ router.post("/",authenticateProducer, async (req, res) => {
   if (!EVENT_TYPE_RE.test(type.trim())) {
     return res.status(400).json({
       error: 'type must follow the "noun.verb" format (e.g. "payment.success")',
+    });
+  }
+
+  const producer = req.producer;
+  if (!producer.allowedEvents.includes(type.trim())) {
+    return res.status(403).json({
+      error: `Producer is not authorized to fire event type: ${type}`,
     });
   }
 

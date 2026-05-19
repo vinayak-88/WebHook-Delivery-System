@@ -1,6 +1,4 @@
 const mongoose = require("mongoose");
-const bcrypt = require("bcrypt");
-const crypto = require("crypto");
 
 const subscriberSchema = new mongoose.Schema(
   {
@@ -31,6 +29,11 @@ const subscriberSchema = new mongoose.Schema(
     signingKey: {
       type: String,
       required: true,
+    },
+    apiSecret: {
+      type: String,
+      required: true,
+      unique: true,
     },
     isActive: {
       type: Boolean,
