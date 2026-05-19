@@ -35,7 +35,7 @@ router.post('/register', async (req, res) => {
     })
   }
   
-  events = events.trim();
+  events = events.map(e => e.trim())
 
   if(typeof secret !== 'string'){
     return res.status(400).json({
