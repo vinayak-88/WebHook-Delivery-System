@@ -1,18 +1,14 @@
 const express = require("express");
 const router = express.Router();
-
-// Bug fix: import paths must match the actual filename casing exactly.
-// On Linux (Docker/CI), the filesystem is case-sensitive. Event.js and
-// Subscriber.js are PascalCase — lowercase imports fail at runtime with
-// MODULE_NOT_FOUND even though they appear to work on macOS.
 const Event = require("../models/Event");
 const Subscriber = require("../models/Subscriber");
 const logger = require("../config/logger");
 const { queueEventDeliveries } = require("../utils/eventQueue");
+const authenticateProducer = require("../middlewares/authenticateProducer");
 
 // POST /events
 // Accept an incoming event, find matching subscribers, queue deliveries
-router.post("/", async (req, res) => {
+router.post("/",authenticateProducer, async (req, res) => {
   const { type, payload } = req.body;
 
   if (
@@ -24,8 +20,6 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ error: "type and payload are required" });
   }
 
-  // validate event type format — must follow "noun.verb" convention to prevent typo mismatches between producers and subscribers.
-  // e.g. "payment.success" is valid, "paymentsuccess" or "PAYMENT_SUCCESS" are not.
   const EVENT_TYPE_RE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
   if (!EVENT_TYPE_RE.test(type.trim())) {
     return res.status(400).json({
@@ -34,7 +28,6 @@ router.post("/", async (req, res) => {
   }
 
   try {
-    /*find out all the subscribers subscribed to that particular event*/
     const subscribers = await Subscriber.find({
       events: type,
       isActive: true,

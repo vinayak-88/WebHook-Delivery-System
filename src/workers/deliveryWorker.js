@@ -71,7 +71,8 @@ const processDeliveryJob = async (job) => {
   }
 
   const bodyBuffer = Buffer.from(JSON.stringify(payload));
-  const signature = generateSignature(bodyBuffer, subscriber.signingKey);
+  const timestamp = Date.now()
+  const signature = generateSignature(bodyBuffer, subscriber.signingKey, timestamp);
 
   try {
     const response = await axios.post(subscriberUrl, bodyBuffer, {
@@ -80,6 +81,7 @@ const processDeliveryJob = async (job) => {
         "X-Webhook-Signature": signature,
         "X-Webhook-Event-Id": eventId,
         "X-Webhook-Attempt": attemptNumber,
+        "X-timestamp" : String(timestamp),
       },
       timeout: 5000,
     });
