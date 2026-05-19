@@ -111,6 +111,50 @@ router.post("/register", async (req, res) => {
   }
 });
 
+router.patch("/events", authenticateSubscriber, async (req, res) => {
+  let { events } = req.body;
+  let subscriber = req.subscriber;
+
+  if (!Array.isArray(events) || events.length === 0) {
+    return res.status(400).json({
+      error: "events must be a non-empty array",
+    });
+  }
+
+  const invalidEvents = events.filter(
+    (e) => typeof e !== "string" || !EVENT_TYPE_RE.test(e.trim()),
+  );
+  if (invalidEvents.length > 0) {
+    return res.status(400).json({
+      error:
+        'Each event type must follow the "noun.verb" format (e.g. "payment.success")',
+      invalid: invalidEvents,
+    });
+  }
+
+  events = events.map((e) => e.trim());
+
+  try {
+    subscriber.events = events;
+    subscriber = await subscriber.save();
+
+    logger.info("Subscriber events update", {
+      subscriberId: subscriber._id,
+      events,
+    });
+    return res.status(200).json({
+      message: "Events updated successfully",
+      events,
+    });
+  } catch (error) {
+    logger.error("Failed to update events", { error: error.message });
+    return res.status(500).json({
+      message: "Failed to update events",
+      events,
+    });
+  }
+});
+
 // DELETE /webhooks/:id
 // Deactivate a subscriber
 router.delete("/", authenticateSubscriber, async (req, res) => {
