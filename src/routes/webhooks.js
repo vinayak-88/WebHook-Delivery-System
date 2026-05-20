@@ -173,7 +173,6 @@ router.delete("/", authenticateSubscriber, async (req, res) => {
 
 // GET /webhooks/:id/logs
 // View delivery history for a subscriber with pagination.
-// Query params: page (default 1), limit (default 50, max 100)
 router.get("/logs", authenticateSubscriber, async (req, res) => {
   let subscriber = req.subscriber
   try {
