@@ -20,7 +20,7 @@ const formatJob = async (job) => ({
   eventId: job.data.eventId,
   subscriberId: job.data.subscriberId,
   subscriberUrl: job.data.subscriberUrl,
-  failureReason: job.data.failureReason || job.failedReason || null,
+  failureReason: job.data.failureReason || null,
   failedAt: job.data.failedAt || null,
   originalJobId: job.data.originalJobId || null,
   timestamp: new Date(job.timestamp).toISOString()
@@ -46,11 +46,6 @@ router.get('/', async (req, res) => {
 })
 
 // POST /dead-letters/:jobId/replay
-// Replay a dead-lettered delivery back into the main queue.
-// The replay job ID is deterministic (no timestamp suffix) so that
-// replaying the same DLQ job twice does not produce duplicate deliveries —
-// BullMQ will reject the second add if a job with that ID already exists
-// and is still active or waiting.
 router.post('/:jobId/replay', async (req, res) => {
   try {
     const deadLetterJob = await deadLetterQueue.getJob(req.params.jobId)
@@ -65,8 +60,7 @@ router.post('/:jobId/replay', async (req, res) => {
       return res.status(400).json({ error: 'Dead-letter job is missing replay data' })
     }
 
-    // Deterministic job ID — prevents double-delivery if replay is
-    // called twice before the first replay job completes
+    // Deterministic job ID — prevents double-delivery if replay is called twice before the first replay job completes
     const replayJobId = `replay:${deadLetterJob.id}`
 
     // Check if a replay is already active or waiting
