@@ -4,13 +4,7 @@ const { deadLetterQueue, deliveryQueue } = require('../queues/deliveryQueue')
 const logger = require('../config/logger')
 
 const DLQ_STATES = [
-  'waiting',
-  'delayed',
-  'active',
-  'completed',
-  'failed',
-  'prioritized',
-  'paused'
+  'waiting'
 ]
 
 const formatJob = async (job) => ({
@@ -32,7 +26,7 @@ router.get('/', async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100)
 
   try {
-    const jobs = await deadLetterQueue.getJobs(DLQ_STATES, 0, limit - 1, false)
+    const jobs = await deadLetterQueue.getJobs(['waiting'], 0, limit - 1, false)
     const formattedJobs = await Promise.all(jobs.map((job) => formatJob(job)))
 
     return res.json({
