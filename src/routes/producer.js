@@ -4,6 +4,8 @@ const Producer = require("../models/Producer");
 const logger = require("../config/logger");
 const authenticateProducer = require("../middlewares/authenticateProducer");
 const { generateApiKey, hashKey } = require("../utils/apiKey");
+const { validateNoSSRF } = require("../utils/ssrf");
+const { validateRegisteredEventTypes } = require("../utils/eventTypeValidator");
 
 const EVENT_TYPE_RE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
 
@@ -22,7 +24,7 @@ router.post("/register", async (req, res) => {
     });
   }
 
-  //validate the events array
+  // Validate the events array syntax
   const invalidEvents = allowedEvents.filter(
     (e) => typeof e !== "string" || !EVENT_TYPE_RE.test(e.trim()),
   );
@@ -36,40 +38,36 @@ router.post("/register", async (req, res) => {
 
   allowedEvents = allowedEvents.map((e) => e.trim());
 
-  //validate the producerUrl
+  // Validate allowedEvents against EventType registry if active
   try {
-    const parsed = new URL(producerUrl);
-    //allow only https so that secrets are encrypted
-    if (parsed.protocol !== "https:" && process.env.NODE_ENV === "production") {
-      return res
-        .status(400)
-        .json({ error: "producerUrl must use HTTPS in production" });
-    }
-    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-      return res
-        .status(400)
-        .json({ error: "producerUrl must be a valid HTTP or HTTPS URL" });
-    }
-  } catch {
-    return res.status(400).json({ error: "producerUrl must be a valid URL" });
+    await validateRegisteredEventTypes(allowedEvents);
+  } catch (err) {
+    return res.status(err.statusCode || 400).json({ error: err.message });
   }
 
-  //create a random 32-byte string as a secret
+  // SSRF & protocol validation on producerUrl
+  try {
+    await validateNoSSRF(producerUrl.trim());
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  // Create a random 32-byte string as API secret
   const rawSecret = generateApiKey();
 
-  //hash that string to store in db
+  // Hash that string to store in DB
   const hashedSecret = hashKey(rawSecret);
 
   try {
     const producer = await Producer.create({
-      producerUrl,
+      producerUrl: producerUrl.trim(),
       apiSecret: hashedSecret,
       allowedEvents,
     });
 
     logger.info("Producer registered", {
       producerId: producer._id,
-      producerUrl,
+      producerUrl: producer.producerUrl,
       allowedEvents,
     });
 
@@ -81,7 +79,6 @@ router.post("/register", async (req, res) => {
       apiKey: rawSecret,
     });
   } catch (err) {
-    //duplicate producer
     if (err.code === 11000) {
       return res.status(409).json({
         error: "A producer with this URL already exists",
@@ -114,6 +111,12 @@ router.patch("/events", authenticateProducer, async (req, res) => {
   }
 
   allowedEvents = allowedEvents.map((e) => e.trim());
+
+  try {
+    await validateRegisteredEventTypes(allowedEvents);
+  } catch (err) {
+    return res.status(err.statusCode || 400).json({ error: err.message });
+  }
 
   try {
     producer.allowedEvents = allowedEvents;

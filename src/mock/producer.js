@@ -1,33 +1,57 @@
 const axios = require('axios')
 
-const BASE_URL = 'http://localhost:3000'
+const BASE_URL = process.env.BASE_URL || 'http://localhost:3000'
 const DELIVERY_WAIT_MS = Number(process.env.DELIVERY_WAIT_MS) || 20000
 
-const SHARED_SECRET = process.env.WEBHOOK_SECRET
-if (!SHARED_SECRET) {
-  throw new Error('WEBHOOK_SECRET env variable is required. Copy .env.example to .env and set it.')
+// Webhook signing secret shared with the mock subscriber (min 32 chars).
+// Must match the `secret` used when registering the subscriber below.
+const SHARED_SECRET =
+  process.env.WEBHOOK_SECRET || 'mock-shared-webhook-secret-at-least-32-chars-long!'
+
+// NOTE: firing events at http://localhost:4000 requires DISABLE_SSRF_CHECK=true
+// on the API server, otherwise SSRF protection rejects localhost/private IPs.
+
+// Step 1: Register a producer (event emitter) and get its management API key
+const registerProducer = async () => {
+  const res = await axios.post(`${BASE_URL}/producers/register`, {
+    producerUrl: 'http://localhost:5000/mock-producer',
+    allowedEvents: ['payment.success', 'payment.failed', 'order.created'],
+  })
+  console.log('[Producer] Producer registered:', {
+    producerId: res.data.producerId,
+  })
+  return res.data.apiKey
 }
 
-// Step 1: Register a subscriber (run once, then comment out)
+// Step 2: Register a subscriber (run once, then comment out)
 const registerSubscriber = async () => {
   const res = await axios.post(`${BASE_URL}/webhooks/register`, {
     subscriberUrl: 'http://localhost:4000/receive',
     events: ['payment.success', 'payment.failed', 'order.created'],
-    secret: SHARED_SECRET
+    secret: SHARED_SECRET,
   })
-  console.log('[Producer] Subscriber registered:', res.data)
-  return res.data.subscriberId
+  console.log('[Producer] Subscriber registered:', {
+    subscriberId: res.data.subscriberId,
+  })
+  return { subscriberId: res.data.subscriberId, apiKey: res.data.apiKey }
 }
 
-// Step 2: Fire an event
-const fireEvent = async (type, payload) => {
-  const res = await axios.post(`${BASE_URL}/events`, { type, payload })
+// Step 3: Fire an event (producer-authenticated)
+const fireEvent = async (producerApiKey, type, payload, idempotencyKey) => {
+  const res = await axios.post(
+    `${BASE_URL}/events`,
+    { type, payload, ...(idempotencyKey ? { idempotencyKey } : {}) },
+    { headers: { 'x-api-key': producerApiKey } }
+  )
   console.log(`[Producer] Event fired (${type}):`, res.data)
+  return res.data
 }
 
-// Step 3: Check delivery logs for a subscriber
-const checkLogs = async (subscriberId) => {
-  const res = await axios.get(`${BASE_URL}/webhooks/${subscriberId}/logs`)
+// Step 4: Check delivery logs for a subscriber (subscriber-authenticated)
+const checkLogs = async (subscriberApiKey) => {
+  const res = await axios.get(`${BASE_URL}/webhooks/logs`, {
+    headers: { 'x-api-key': subscriberApiKey },
+  })
   console.log('[Producer] Delivery logs:')
   res.data.logs.forEach(log => {
     const status = log.success ? '✅' : '❌'
@@ -37,28 +61,32 @@ const checkLogs = async (subscriberId) => {
 
 const run = async () => {
   try {
-    // Register subscriber
+    // Register producer + subscriber
+    console.log('\n--- Registering Producer ---')
+    const producerApiKey = await registerProducer()
+
     console.log('\n--- Registering Subscriber ---')
-    const subscriberId = await registerSubscriber()
+    const { subscriberId, apiKey: subscriberApiKey } = await registerSubscriber()
+    void subscriberId
 
     // Wait a moment then fire multiple events
     await new Promise(r => setTimeout(r, 500))
 
     console.log('\n--- Firing Events ---')
-    await fireEvent('payment.success', {
+    await fireEvent(producerApiKey, 'payment.success', {
       orderId: `ORD-${Date.now()}`,
       amount: 4999,
       currency: 'INR',
       userId: 'user_123'
     })
 
-    await fireEvent('order.created', {
+    await fireEvent(producerApiKey, 'order.created', {
       orderId: `ORD-${Date.now() + 1}`,
       items: ['item_a', 'item_b'],
       total: 1299
     })
 
-    await fireEvent('payment.failed', {
+    await fireEvent(producerApiKey, 'payment.failed', {
       orderId: `ORD-${Date.now() + 2}`,
       reason: 'insufficient_funds'
     })
@@ -68,7 +96,7 @@ const run = async () => {
     await new Promise(r => setTimeout(r, DELIVERY_WAIT_MS))
 
     console.log('\n--- Delivery Logs ---')
-    await checkLogs(subscriberId)
+    await checkLogs(subscriberApiKey)
 
   } catch (err) {
     console.error('[Producer] Error:', err.response?.data || err.message)

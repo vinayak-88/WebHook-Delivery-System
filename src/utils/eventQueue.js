@@ -1,6 +1,7 @@
 const Event = require("../models/Event");
 const { deliveryQueue } = require("../queues/deliveryQueue");
 const logger = require("../config/logger");
+const { assertValidDeliveryJobData } = require("./jobSchema");
 
 const PENDING_QUEUE_STATUS = "pending";
 const QUEUED_QUEUE_STATUS = "queued";
@@ -10,19 +11,27 @@ const buildJobId = (eventId, subscriberId) =>
   `event:${eventId}:subscriber:${subscriberId}`;
 
 const buildDeliveryJobs = (event) =>
-  event.deliveryTargets.map((target) => ({
-    name: "deliver",
-    data: {
+  event.deliveryTargets.map((target) => {
+    const data = {
       eventId: event._id.toString(),
       subscriberId: target.subscriberId.toString(),
       subscriberUrl: target.subscriberUrl,
       payload: event.payload,
-      // secret intentionally omitted — worker fetches it from DB
-    },
-    opts: {
-      jobId: buildJobId(event._id.toString(), target.subscriberId.toString()),
-    },
-  }));
+      requestId: event.requestId || null,
+      // secret intentionally omitted — worker fetches and decrypts it from DB
+    };
+
+    // Validate job data schema before queueing
+    assertValidDeliveryJobData(data);
+
+    return {
+      name: "deliver",
+      data,
+      opts: {
+        jobId: buildJobId(event._id.toString(), target.subscriberId.toString()),
+      },
+    };
+  });
 
 const markEventQueueState = async (eventId, updates) =>
   Event.findByIdAndUpdate(eventId, updates, { new: true });
@@ -72,7 +81,7 @@ const queueEventDeliveries = async (event) => {
 
 const recoverPendingEvents = async ({ limit = 25 } = {}) => {
   const pendingEvents = await Event.find({ queueStatus: PENDING_QUEUE_STATUS })
-    .sort({ createdAt: 1 }) //ascending order
+    .sort({ createdAt: 1 }) // ascending order
     .limit(limit);
 
   let recovered = 0;
@@ -103,9 +112,7 @@ const startPendingEventRecovery = ({
     return null;
   }
 
-  //to prevent multiple instances of the server from running the recovery process 
-  // i.e. setInterval will only be triggered by one first instance only when multiple instances are running to avoid duplicate deliveries
-
+  // Prevents multiple instances of the server from running concurrent recovery scans
   if (process.env.DISABLE_RECOVERY === "true") {
     logger.warn(
       "Pending event recovery is disabled via DISABLE_RECOVERY=true. " +
