@@ -36,12 +36,22 @@ const deliveryLogSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    /**
+     * Elapsed time of the outbound HTTP attempt in milliseconds.
+     * Measured around the Axios request for both success and failure.
+     */
+    durationMs: {
+      type: Number,
+      default: null,
+    },
     requestId: {
       type: String,
       default: null,
     },
   },
-  { timestamps: true }
+  // Append-only audit record: DeliveryLog documents are never updated after
+  // creation, so only createdAt is generated (no misleading updatedAt).
+  { timestamps: { createdAt: true, updatedAt: false } }
 );
 
 // Compound index for querying subscriber logs sorted by newest first:

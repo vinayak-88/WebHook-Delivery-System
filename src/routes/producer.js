@@ -119,7 +119,7 @@ router.patch("/events", authenticateProducer, async (req, res) => {
   } catch (error) {
     logger.error("Failed to update events", { error: error.message });
     return res.status(500).json({
-      message: "Failed to update events",
+      error: "Failed to update events",
       allowedEvents,
     });
   }

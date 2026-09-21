@@ -1,5 +1,5 @@
 require("dotenv").config();
-const { Worker } = require("bullmq");
+const { Worker, UnrecoverableError } = require("bullmq");
 const axios = require("axios");
 const redisConnection = require("../config/redis");
 const connectDB = require("../config/db");
@@ -11,10 +11,24 @@ const { generateSignature } = require("../utils/hmac");
 const { decrypt } = require("../utils/encryption");
 const { validateNoSSRF } = require("../utils/ssrf");
 const { assertValidDeliveryJobData } = require("../utils/jobSchema");
+const { isRetryableError } = require("../utils/retryPolicy");
 
 const RETRY_JITTER_MS = Number(process.env.RETRY_JITTER_MS) || 500;
 // Single application-level timeout for all outbound webhook requests.
 const WEBHOOK_TIMEOUT_MS = Number(process.env.WEBHOOK_TIMEOUT_MS) || 5000;
+// Upper bound on the subscriber response text kept in the audit log.
+// Only the persisted representation is truncated — the live response,
+// status handling, and retry behavior are untouched.
+const MAX_RESPONSE_BODY_CHARS =
+  Number(process.env.MAX_DELIVERY_RESPONSE_BODY_CHARS) || 8192;
+const TRUNCATED_SUFFIX = "...[truncated]";
+
+const truncateResponseBody = (body) => {
+  if (typeof body !== "string" || body.length <= MAX_RESPONSE_BODY_CHARS) {
+    return body;
+  }
+  return `${body.slice(0, MAX_RESPONSE_BODY_CHARS)}${TRUNCATED_SUFFIX}`;
+};
 
 const rawConcurrency = Number(process.env.WORKER_CONCURRENCY);
 const workerConcurrency =
@@ -30,6 +44,7 @@ const buildLogPayload = ({
   success,
   errorMessage,
   requestId,
+  durationMs,
 }) => ({
   eventId,
   subscriberId,
@@ -40,6 +55,7 @@ const buildLogPayload = ({
   success,
   errorMessage,
   requestId: requestId || null,
+  durationMs: durationMs ?? null,
 });
 
 const persistDeliveryLog = async (
@@ -80,20 +96,70 @@ const processDeliveryJob = async (job) => {
   // 2. SSRF destination validation immediately before outbound request
   await validateNoSSRF(subscriberUrl);
 
-  // 3. Fetch subscriber and decrypt secret
+  // 3. Fetch subscriber.
+  // A lookup failure here (e.g. MongoDB temporarily unavailable) propagates
+  // untouched so BullMQ retries it — only the resolved outcome below is
+  // classified as permanent.
   const subscriber = await Subscriber.findById(subscriberId).select(
     "signingKey isActive",
   );
+
+  // Persists an auditable record of a failure that happened BEFORE any
+  // outbound HTTP request. statusCode/responseBody/durationMs stay null so
+  // the log never implies an HTTP request occurred.
+  const logPreDeliveryFailure = async (errorMessage, reason) => {
+    logger.warn(`Job ${job.id} permanent pre-delivery failure`, {
+      attempt: attemptNumber,
+      subscriberId,
+      eventId,
+      reason,
+      requestId,
+    });
+    await persistDeliveryLog(
+      buildLogPayload({
+        eventId,
+        subscriberId,
+        subscriberUrl,
+        attemptNumber,
+        statusCode: null,
+        responseBody: null,
+        success: false,
+        errorMessage,
+        requestId,
+        durationMs: null,
+      }),
+    );
+  };
+
+  // Missing or deactivated subscribers will never succeed — fail fast
+  // instead of burning all 5 attempts.
   if (!subscriber || !subscriber.isActive) {
-    throw new Error(`Subscriber ${subscriberId} is inactive or not found`);
+    const errorMessage = `Subscriber ${subscriberId} is inactive or not found`;
+    await logPreDeliveryFailure(
+      errorMessage,
+      !subscriber ? "subscriber-not-found" : "subscriber-inactive",
+    );
+    throw new UnrecoverableError(errorMessage);
   }
 
-  const signingKey = decrypt(subscriber.signingKey);
+  // 4. Decrypt the secret and prepare the signed payload.
+  // Purely local, deterministic operations: a failure here (corrupt secret,
+  // unserializable payload, HMAC misconfiguration) cannot heal on retry.
+  let bodyBuffer;
+  let signature;
+  let timestamp;
+  try {
+    const signingKey = decrypt(subscriber.signingKey);
+    bodyBuffer = Buffer.from(JSON.stringify(payload));
+    timestamp = Date.now();
+    signature = generateSignature(bodyBuffer, signingKey, timestamp);
+  } catch (err) {
+    const errorMessage = `Permanent pre-delivery failure: ${err.message}`;
+    await logPreDeliveryFailure(errorMessage, "signing-preparation-failed");
+    throw new UnrecoverableError(errorMessage);
+  }
 
-  const bodyBuffer = Buffer.from(JSON.stringify(payload));
-  const timestamp = Date.now();
-  const signature = generateSignature(bodyBuffer, signingKey, timestamp);
-
+  const attemptStartedAt = Date.now();
   try {
     const response = await axios.post(subscriberUrl, bodyBuffer, {
       headers: {
@@ -107,6 +173,7 @@ const processDeliveryJob = async (job) => {
       timeout: WEBHOOK_TIMEOUT_MS,
       maxRedirects: 0, // Prevent redirect-based SSRF bypass
     });
+    const durationMs = Date.now() - attemptStartedAt;
 
     await persistDeliveryLog(
       buildLogPayload({
@@ -115,10 +182,11 @@ const processDeliveryJob = async (job) => {
         subscriberUrl,
         attemptNumber,
         statusCode: response.status,
-        responseBody: JSON.stringify(response.data),
+        responseBody: truncateResponseBody(JSON.stringify(response.data)),
         success: true,
         errorMessage: null,
         requestId,
+        durationMs,
       }),
     );
 
@@ -130,9 +198,10 @@ const processDeliveryJob = async (job) => {
 
     return response;
   } catch (err) {
+    const durationMs = Date.now() - attemptStartedAt;
     const statusCode = err.response ? err.response.status : null;
     const responseBody = err.response
-      ? JSON.stringify(err.response.data)
+      ? truncateResponseBody(JSON.stringify(err.response.data))
       : null;
     const errorMessage = err.message;
 
@@ -161,8 +230,17 @@ const processDeliveryJob = async (job) => {
         success: false,
         errorMessage,
         requestId,
+        durationMs,
       }),
     );
+
+    // Permanent client errors (e.g. 400/401/403/404) will never succeed on
+    // retry — fail fast to the DLQ instead of burning all 5 attempts.
+    if (!isRetryableError(err)) {
+      throw new UnrecoverableError(
+        `Permanent delivery failure (status ${statusCode}): ${errorMessage}`,
+      );
+    }
 
     throw err;
   }
@@ -189,7 +267,12 @@ deliveryWorker.on("failed", async (job, err) => {
     return;
   }
 
-  if (job.attemptsMade >= MAX_DELIVERY_ATTEMPTS) {
+  // Escalate permanent failures immediately (UnrecoverableError fails the job
+  // without consuming all attempts) as well as exhausted retries.
+  const isPermanent =
+    err instanceof UnrecoverableError || err?.name === "UnrecoverableError";
+
+  if (isPermanent || job.attemptsMade >= MAX_DELIVERY_ATTEMPTS) {
     logger.error(
       `Job ${job.id} permanently failed — moving to dead letter queue`,
       {
@@ -265,4 +348,6 @@ if (require.main === module) {
 module.exports = {
   deliveryWorker,
   processDeliveryJob,
+  truncateResponseBody,
+  MAX_RESPONSE_BODY_CHARS,
 };

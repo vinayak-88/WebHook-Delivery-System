@@ -124,7 +124,14 @@ app.use((err, req, res, next) => {
     requestId: req.requestId,
   });
 
-  res.status(err.statusCode || 500).json({ error: err.message || "Internal server error" });
+  const statusCode = err.statusCode || 500;
+  // Never leak internals (stacks, driver messages) in production responses
+  const message =
+    statusCode === 500 && process.env.NODE_ENV === "production"
+      ? "Internal server error"
+      : err.message || "Internal server error";
+
+  res.status(statusCode).json({ error: message });
 });
 
 const PORT = process.env.PORT || 3000;

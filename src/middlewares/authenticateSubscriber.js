@@ -3,7 +3,7 @@ const { hashKey } = require("../utils/apiKey");
 
 const authenticateSubscriber = async (req, res, next) => {
   const apiKey = req.headers["x-api-key"];
-  if (!apiKey) return res.status(401).json({ message: "API key required" });
+  if (!apiKey) return res.status(401).json({ error: "API key required" });
 
   const hashed = hashKey(apiKey);
   try {
@@ -12,7 +12,7 @@ const authenticateSubscriber = async (req, res, next) => {
       isActive: true,
     });
 
-    if (!subscriber) return res.status(401).json({ message: "Invalid API key" });
+    if (!subscriber) return res.status(401).json({ error: "Invalid API key" });
     req.subscriber = subscriber;
     next();
   } catch (error) {

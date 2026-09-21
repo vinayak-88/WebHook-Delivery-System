@@ -1,5 +1,19 @@
 # Project Context: Webhook Delivery System
 
+> **Scope simplification note:** six advanced features were deliberately removed to keep
+> the project interview-ready for a 1–2 year backend developer: the EventType registry,
+> DLQ monitoring/alerting, per-subscriber timeout config (replaced by a single global
+> `WEBHOOK_TIMEOUT_MS`), the secret rotation endpoint, plaintext-secret migration
+> compatibility (secrets are now always encrypted), the Redis circuit breaker, and the
+> bulk `POST /dead-letters/replay-all` endpoint. Single-job DLQ replay
+> (`POST /dead-letters/:jobId/replay`) and its `Event` replay-tracking fields remain.
+> A later quality pass added failure classification (permanent `4xx` and deterministic
+> pre-delivery failures fail fast via BullMQ `UnrecoverableError`; transient
+> DB/network errors retry), `durationMs` delivery timing, and consistent
+> `{ "error": ... }` API responses.
+> A few older sections below still describe the pre-simplification system; where a
+> section conflicts with this note, this note wins.
+
 ## 1. Project Overview
 
 The **Webhook Delivery System** is a production-style, asynchronous event fan-out and webhook delivery engine built in Node.js. It accepts event notifications from authenticated producers, matches them against active subscribers subscribed to specific event types, persists the events, and asynchronously delivers payloads to subscriber HTTP endpoints.
@@ -76,7 +90,7 @@ The system is partitioned into two independent runtime processes: the **API Serv
 ### Step 2: Subscriber Registration
 1. A subscriber registers via `POST /webhooks/register` with `subscriberUrl`, `events` (array of `noun.verb` strings), and a `secret` (minimum 32 characters).
 2. The system validates the URL (HTTPS required in production) and generates a random 32-byte hex API key.
-3. The server saves the record: `Subscriber.signingKey` stores the plaintext webhook `secret`, and `Subscriber.apiSecret` stores the SHA-256 hash of the generated API key.
+3. The server saves the record: `Subscriber.signingKey` stores the AES-256-GCM encrypted webhook `secret`, and `Subscriber.apiSecret` stores the SHA-256 hash of the generated API key.
 4. The server returns `201 Created` with `apiKey` for subscriber management authentication.
 
 ### Step 3: Event Ingestion (`POST /events`)
@@ -232,7 +246,7 @@ Tracks authorized event emitting clients.
 Tracks receiving webhook endpoints.
 - `subscriberUrl` (String, required, trimmed, unique): Target HTTP/S endpoint.
 - `events` ([String], required): Array of event types the subscriber listens to. Must be non-empty with no duplicates.
-- `signingKey` (String, required): Webhook secret stored in plaintext, used by the worker to compute HMAC signatures.
+- `signingKey` (String, required): Webhook secret stored AES-256-GCM encrypted at rest, decrypted by the worker at delivery time to compute HMAC signatures.
 - `apiSecret` (String, required, unique): SHA-256 hash of the management API key.
 - `isActive` (Boolean, default `true`): Deactivation flag. Deactivated subscribers are excluded from new event deliveries.
 - `virtual('secret')`: Virtual setter mapping `secret` directly to `signingKey`.
@@ -307,7 +321,7 @@ Immutable audit log for each individual delivery attempt.
   - Body: `{ subscriberUrl, events, secret }`
   - Validation: `secret` must be a string of at least 32 characters; `events` must be a non-empty array of valid `noun.verb` strings; `subscriberUrl` must be a valid URL (enforces `https:` in `NODE_ENV === 'production'`).
   - Key Generation: Generates a 32-byte hex API key (`apiKey`), hashes it with SHA-256 (`apiSecret`).
-  - Secret Storage: Assigns `secret` directly to `signingKey` in MongoDB via virtual setter.
+  - Secret Storage: Encrypts `secret` with AES-256-GCM before storing in `signingKey` in MongoDB via virtual setter.
   - Response (`201 Created`): Returns `subscriberId`, `subscriberUrl`, `events`, and the plaintext `apiKey`.
 - **Endpoint:** `PATCH /webhooks/events`
   - Authentication: `authenticateSubscriber` via `x-api-key`.
@@ -353,12 +367,12 @@ Immutable audit log for each individual delivery attempt.
    - `bodyBuffer = Buffer.from(JSON.stringify(payload))`
    - `timestamp = Date.now()`
 4. **Signature Calculation:**
-   - Computes HMAC-SHA256 signature using `subscriber.signingKey` over `${timestamp}.` concatenated with `bodyBuffer`.
+   - Decrypts the AES-256-GCM encrypted `subscriber.signingKey`, then computes the HMAC-SHA256 signature over `${timestamp}.` concatenated with `bodyBuffer`.
 5. **HTTP POST Request:**
    - Client: Axios
    - URL: `subscriberUrl`
    - Body: Raw `bodyBuffer`
-   - Timeout: Hardcoded `5000ms`
+   - Timeout: Global `WEBHOOK_TIMEOUT_MS` (default `5000ms`)
    - Headers:
      - `Content-Type: application/json`
      - `X-Webhook-Signature: <hex>`
@@ -375,7 +389,7 @@ Immutable audit log for each individual delivery attempt.
 ## 12. HMAC and Security
 
 ### Secret Storage & Key Management
-- **Webhook Secrets (`signingKey`):** Stored in **plaintext** in MongoDB (`Subscriber.signingKey`). There is no key derivation function (such as HKDF) or hashing applied to the webhook delivery secret.
+- **Webhook Secrets (`signingKey`):** Stored **AES-256-GCM encrypted at rest** in MongoDB (`Subscriber.signingKey`) using the server-side `WEBHOOK_ENCRYPTION_KEY`. The worker decrypts the secret at delivery time to compute HMAC signatures.
 - **Management API Keys (`apiSecret`):**
   - Generated using `crypto.randomBytes(32).toString('hex')` (64 hex characters).
   - Hashed using SHA-256: `crypto.createHash('sha256').update(key).digest('hex')`.
@@ -405,8 +419,8 @@ express.json({
 This preserves the raw wire buffer `req.rawBody` for verification, avoiding property re-ordering issues common in JSON re-serialization.
 
 ### SSRF Protection Status
-- **Current Protection:** URL string validation via `new URL()` and protocol checks. Enforces `https:` when `NODE_ENV === 'production'`.
-- **Limitation:** There is **no private IP or loopback protection**. The worker does not resolve DNS or block private IP ranges (e.g., `127.0.0.1`, `10.0.0.0/8`, `169.254.169.254`).
+- **Current Protection:** URL syntax validation via `new URL()` plus DNS-based checks in `src/utils/ssrf.js`: hostnames are resolved and every IP is matched against blocked ranges (loopback, RFC 1918 private, link-local/`169.254.x.x` metadata, IPv6 equivalents). Enforces `https:` when `NODE_ENV === 'production'`; Axios uses `maxRedirects: 0`.
+- **Bypass (dev/test only):** `DISABLE_SSRF_CHECK=true` skips the check for the localhost mock subscriber. Never enable in production.
 
 ---
 
@@ -428,16 +442,18 @@ With `baseDelay = 1000ms` and `MAX_DELIVERY_ATTEMPTS = 5`:
 
 ### Failure Behavior
 - **Thundering Herd Mitigation:** Exponential backoff spaces out subsequent delivery attempts to allow recovering downstream services time to stabilize.
-- **Client Error Retries (Limitation):** The worker treats all thrown errors identically. A subscriber returning `400 Bad Request` or `404 Not Found` is retried all 5 times before failing, rather than failing fast.
+- **Retry Classification (current):** Only transient failures are retried (network errors, timeouts, `408`, `429`, `5xx`). Permanent client errors (other `4xx`) throw BullMQ's `UnrecoverableError` and escalate to the DLQ immediately without consuming all 5 attempts. See `src/utils/retryPolicy.js`.
 
 ---
 
 ## 14. Dead Letter Queue
 
 ### Escalation Mechanism
-When a job fails and `job.attemptsMade >= MAX_DELIVERY_ATTEMPTS` (5):
-1. BullMQ triggers the `deliveryWorker.on('failed')` event handler.
-2. The handler enqueues the job into `deadLetterQueue` (`webhook-dead-letter`):
+A job escalates to the DLQ in either of two cases:
+1. Permanent failure: the worker throws BullMQ's `UnrecoverableError` (non-retryable `4xx`), escalated on the first failure.
+2. Exhausted retries: `job.attemptsMade >= MAX_DELIVERY_ATTEMPTS` (5) for transient failures.
+
+In both cases BullMQ triggers the `deliveryWorker.on('failed')` event handler, which enqueues the job into `deadLetterQueue` (`webhook-dead-letter`):
    - Job Name: `'failed-delivery'`
    - Job Data:
      ```javascript
@@ -454,7 +470,7 @@ When a job fails and `job.attemptsMade >= MAX_DELIVERY_ATTEMPTS` (5):
 - Query parameter: `limit` (default 50, range 1 to 100).
 - Retrieves jobs in `'waiting'` state from `deadLetterQueue`.
 - Formats jobs with: `jobId`, `name`, `state`, `eventId`, `subscriberId`, `subscriberUrl`, `failureReason`, `failedAt`, `originalJobId`, `timestamp`.
-- *Security Note:* This endpoint has **no authentication**.
+- *Security Note:* Protected by `authenticateAdmin` (`X-Admin-Api-Key`); unauthenticated callers receive `401`.
 
 ### DLQ Replay (`POST /dead-letters/:jobId/replay`)
 - Retrieves the failed job by ID from `deadLetterQueue`.
@@ -474,15 +490,17 @@ When a job fails and `job.attemptsMade >= MAX_DELIVERY_ATTEMPTS` (5):
 Every HTTP delivery attempt creates a dedicated `DeliveryLog` record in MongoDB via `persistDeliveryLog`.
 
 ### Logged Fields
+DeliveryLog records are append-only (`createdAt` only, no `updatedAt`).
 - `eventId`: Reference to the `Event`.
 - `subscriberId`: Reference to the `Subscriber`.
 - `subscriberUrl`: Endpoint URL.
 - `attemptNumber`: Attempt sequence (1 through 5).
 - `statusCode`: HTTP status code from the subscriber response (`null` if request failed due to DNS, timeout, or TCP reset).
-- `responseBody`: JSON-stringified response data (`null` on network errors).
+- `responseBody`: JSON-stringified response data (`null` on network errors), truncated to `MAX_DELIVERY_RESPONSE_BODY_CHARS` (default 8192) with a `...[truncated]` marker when longer. The bound applies only to the persisted audit copy, never to delivery behavior.
 - `success`: Boolean (`true` for HTTP 2xx, `false` otherwise).
 - `errorMessage`: Error string (`err.message`) on failure, `null` on success.
-- `createdAt` / `updatedAt`: Automatic Mongoose timestamps.
+- `durationMs`: Elapsed time of the outbound HTTP attempt in milliseconds (success and failure).
+- `createdAt`: Automatic Mongoose timestamp.
 
 ### Auditability
 Subscribers can inspect their complete delivery log history via `GET /webhooks/logs`. Results are sorted in descending order (`createdAt: -1`) and populated with event details (`type`, `payload`, `createdAt`).
@@ -895,7 +913,7 @@ app.post('/receive', (req, res) => {
 | :--- | :--- | :--- |
 | **Decoupled Worker Process** | Worker runs in separate Node.js process; API returns `202 Accepted` immediately. Slow subscriber endpoints cannot saturate API event loops or HTTP sockets. | Operational overhead: requires deploying, monitoring, and scaling two distinct application processes. |
 | **Redis/BullMQ for Queueing** | Built-in exponential backoff, job state transitions, concurrency limits, and persistence. | Redis becomes a single point of failure for real-time delivery unless deployed with Redis Sentinel or Redis Cluster. |
-| **Plaintext Signing Key Storage** | Simplifies worker lookup and avoids key derivation latency per delivery attempt. | Severe operational security vulnerability: MongoDB read compromise immediately leaks all subscriber webhook secrets. |
+| **Encrypted Signing Key Storage** | `Subscriber.signingKey` is AES-256-GCM encrypted at rest; the worker decrypts it per delivery. Avoids a total secret leak on MongoDB read compromise. | Per-delivery decryption cost and a server-side `WEBHOOK_ENCRYPTION_KEY` that must be managed/rotated out of band. |
 | **Timestamp Prepended to HMAC** | Signs `${timestamp}.${bodyBuffer}` and enforces a 5-minute replay window. | Subscriber verification logic is strictly coupled to the timestamp header format and clock synchronization. |
 | **Delivery Target Snapshotting** | Subscribed endpoints are snapshotted into `Event.deliveryTargets` at ingestion time. | Prevents retroactively adding subscribers to past events; adds document size overhead to the `events` collection. |
 | **Deterministic BullMQ Job IDs** | Job ID formatted as `event:<id>:subscriber:<id>`. Prevents duplicate jobs in Redis during recovery ticks. | Does not prevent re-queueing once completed jobs are evicted past `removeOnComplete: 100`. |
@@ -915,9 +933,11 @@ app.post('/receive', (req, res) => {
 - **During Worker Execution:** IORedis emits reconnection errors. BullMQ halts job polling until the Redis connection is re-established. Active jobs may stall and be reclaimed upon reconnection.
 
 ### 3. Downstream Subscriber Errors (4xx vs 5xx)
-- **HTTP 4xx (Client Errors, e.g., 400, 401, 404):** The worker catches the Axios error, persists a failed `DeliveryLog`, and rethrows. BullMQ retries the job across all 5 attempts. *Limitation:* The system does not fail-fast on non-retryable 4xx errors.
+- **HTTP 4xx (Client Errors, e.g., 400, 401, 404):** Other `4xx` responses are permanent failures. The worker persists a failed `DeliveryLog` and throws BullMQ's `UnrecoverableError`, escalating to the DLQ on the first failure without consuming all 5 attempts.
+- **Retryable statuses (`408`, `429`):** Treated as transient and retried like `5xx`.
 - **HTTP 5xx (Server Errors, e.g., 500, 502, 503):** Handled as transient failures. Retried across 5 attempts with exponential backoff.
-- **Network Timeouts / Connection Refusal:** Axios times out at 5000ms or fails immediately on `ECONNREFUSED`. Persists `DeliveryLog` with `statusCode: null` and `errorMessage: err.message`. Retried by BullMQ.
+- **Network Timeouts / Connection Refusal:** Axios times out at the global `WEBHOOK_TIMEOUT_MS` or fails immediately on `ECONNREFUSED`. Persists `DeliveryLog` with `statusCode: null` and `errorMessage: err.message`. Retried by BullMQ.
+- **Pre-delivery failures:** Missing/inactive subscribers and deterministic signing failures (undecryptable secret, HMAC preparation) fail fast via `UnrecoverableError` with `statusCode: null` audit logs. Transient `Subscriber.findById` database errors propagate so BullMQ retries them.
 
 ### 4. Retry Exhaustion & DLQ Movement
 - When all 5 delivery attempts fail, BullMQ emits `failed` on `deliveryWorker`.
@@ -1005,11 +1025,17 @@ Unit tests are located in `src/tests/` and run via `jest --runInBand src/tests`.
 | `REDIS_HOST` | Redis host address | `localhost` |
 | `REDIS_PORT` | Redis port number | `6379` |
 | `NODE_ENV` | Environment mode (`development`, `production`, `test`) | `development` |
-| `WEBHOOK_SECRET` | Secret string for HMAC signing (min 32 chars) | Required |
+| `BODY_LIMIT` | Max JSON body size for incoming requests | `16kb` |
+| `WEBHOOK_ENCRYPTION_KEY` | 64-char hex key for AES-256-GCM secret encryption at rest | Required in production |
+| `ADMIN_API_KEY` | Admin key for DLQ inspection & replay (`X-Admin-Api-Key`) | Required for DLQ routes |
+| `WEBHOOK_TIMEOUT_MS` | Global timeout for outbound webhook delivery requests | `5000` |
 | `WORKER_CONCURRENCY` | Number of concurrent jobs processed by the delivery worker | `5` |
+| `RETRY_JITTER_MS` | Max random jitter added to exponential backoff delays | `500` |
+| `SHUTDOWN_TIMEOUT_MS` | Max wait before forced exit during graceful shutdown | `10000` |
 | `RECOVERY_INTERVAL_MS` | Milliseconds between pending event recovery scans | `5000` |
 | `RECOVERY_BATCH_SIZE` | Maximum number of pending events scanned per tick | `25` |
 | `DISABLE_RECOVERY` | If `'true'`, disables the background pending recovery loop | `false` |
+| `DISABLE_SSRF_CHECK` | If `'true'`, allows deliveries to localhost/private IPs (dev/test only) | `false` |
 
 ---
 
@@ -1044,6 +1070,14 @@ docker-compose up --build
 
 ## 28. Known Limitations and Production Gaps
 
+> **Note:** items 1–4, 6, 7 and 10–12 below were addressed in later implementation
+> rounds (encrypted secrets at rest, DNS-based SSRF checks, ingestion idempotency,
+> MongoDB indexes, Redis-backed rate limiting, DLQ admin auth, global
+> `WEBHOOK_TIMEOUT_MS`, `GET /ready` readiness check, fixed tests and mocks,
+> failure classification (permanent `4xx` and deterministic pre-delivery
+> failures fail fast via `UnrecoverableError`; transient DB/network errors retry).
+> Items 5 and 9 remain open.
+
 1. **Plaintext Secret Storage:** `Subscriber.signingKey` is stored in plaintext in MongoDB. An attacker with read access to the database can forge deliveries to all subscribers.
 2. **Lack of SSRF Mitigation:** `subscriberUrl` and `producerUrl` validation only checks URL format and HTTPS protocol in production. Private IP ranges (e.g., `127.0.0.1`, `10.0.0.0/8`, AWS metadata endpoint `169.254.169.254`) are not resolved or blocked.
 3. **No Ingestion Idempotency (`POST /events`):** No `Idempotency-Key` header or deduplication index exists. Producer retries result in duplicate events and multiple deliveries to subscribers.
@@ -1053,7 +1087,7 @@ docker-compose up --build
 5. **No Distributed Locking on Event Recovery:** The recovery loop uses an in-process boolean flag (`isRunning`). Running multiple API replicas without `DISABLE_RECOVERY=true` causes overlapping recovery queries and duplicate queue additions.
 6. **In-Memory Rate Limiting:** `express-rate-limit` maintains counters in process memory instead of Redis. The effective rate limit scales linearly with the number of API instances.
 7. **Unauthenticated DLQ Endpoints:** `GET /dead-letters` and `POST /dead-letters/:jobId/replay` lack authentication middleware, allowing unauthorized inspection and replay of failed jobs.
-8. **Blind Retrying on 4xx Client Errors:** The worker does not distinguish between 4xx client errors and 5xx/network errors, unnecessarily retrying invalid payloads across all 5 attempts.
+8. **Blind Retrying on 4xx Client Errors:** (Fixed — kept as historical note.) The worker now distinguishes permanent `4xx` failures (fail fast via `UnrecoverableError`) from transient `408`/`429`/`5xx`/network errors (retried). See `src/utils/retryPolicy.js` and §13.
 9. **Incomplete DLQ Replay State:** Replaying a job from the DLQ does not remove it from the DLQ queue, nor does it update `Event.queueStatus` in MongoDB.
 10. **Hardcoded Delivery Timeout:** Outgoing Axios requests have a fixed 5000ms timeout with no per-subscriber timeout configurability.
 11. **Shallow Health Check:** `GET /health` returns `{ status: "ok" }` unconditionally without checking MongoDB or Redis connectivity.

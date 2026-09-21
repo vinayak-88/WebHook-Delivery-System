@@ -8,8 +8,9 @@ const DELIVERY_WAIT_MS = Number(process.env.DELIVERY_WAIT_MS) || 20000
 const SHARED_SECRET =
   process.env.WEBHOOK_SECRET || 'mock-shared-webhook-secret-at-least-32-chars-long!'
 
-// NOTE: firing events at http://localhost:4000 requires DISABLE_SSRF_CHECK=true
-// on the API server, otherwise SSRF protection rejects localhost/private IPs.
+// NOTE: both the producer URL (localhost:5000) and the subscriber URL
+// (localhost:4000) require DISABLE_SSRF_CHECK=true on the API server,
+// otherwise SSRF protection rejects localhost/private IPs.
 
 // Step 1: Register a producer (event emitter) and get its management API key
 const registerProducer = async () => {

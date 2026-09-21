@@ -27,12 +27,21 @@ jest.mock('../queues/deliveryQueue', () => ({
 }));
 // Mock BullMQ Worker so importing deliveryWorker doesn't hold open Redis
 // handles/timers in Jest. processDeliveryJob (the real handler) is still tested.
-jest.mock('bullmq', () => ({
-  Worker: jest.fn().mockImplementation(() => ({
-    on: jest.fn(),
-    close: jest.fn().mockResolvedValue(undefined),
-  })),
-}));
+jest.mock('bullmq', () => {
+  class MockUnrecoverableError extends Error {
+    constructor(message) {
+      super(message);
+      this.name = 'UnrecoverableError';
+    }
+  }
+  return {
+    UnrecoverableError: MockUnrecoverableError,
+    Worker: jest.fn().mockImplementation(() => ({
+      on: jest.fn(),
+      close: jest.fn().mockResolvedValue(undefined),
+    })),
+  };
+});
 
 const axios = require('axios');
 const DeliveryLog = require('../models/DeliveryLog');
@@ -140,17 +149,22 @@ describe('Delivery Retry Behaviour', () => {
     );
   });
 
-  it('throws permanently when subscriber record is not found', async () => {
+  it('fails fast without retrying when subscriber record is not found', async () => {
     Subscriber.findById.mockReturnValue({
       select: jest.fn().mockResolvedValue(null),
     });
 
-    await expect(processDeliveryJob(makeJob())).rejects.toThrow(
-      'Subscriber 507f191e810c19729de860ea is inactive or not found'
-    );
+    await expect(processDeliveryJob(makeJob())).rejects.toMatchObject({
+      name: 'UnrecoverableError',
+      message: 'Subscriber 507f191e810c19729de860ea is inactive or not found',
+    });
 
     expect(axios.post).not.toHaveBeenCalled();
-    expect(DeliveryLog.create).not.toHaveBeenCalled();
+    // The failed attempt is still audited — with nulls, since no HTTP happened
+    expect(DeliveryLog.create).toHaveBeenCalledTimes(1);
+    expect(DeliveryLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({ success: false, statusCode: null, responseBody: null })
+    );
   });
 
   it('succeeds after simulated retry (fail once then succeed)', async () => {
