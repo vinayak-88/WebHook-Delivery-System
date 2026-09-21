@@ -45,7 +45,7 @@ When the worker delivers to a subscriber URL, the subscriber has no way to know 
 String comparison with === short-circuits — it stops at the first non-matching character. An attacker can measure tiny differences in response time to guess the correct signature one character at a time (timing attack). `crypto.timingSafeEqual` always takes the same amount of time regardless of where the mismatch is, making this attack impossible.
 
 ### Why a dead letter queue?
-Jobs that exhaust all retry attempts don't silently disappear. They land in a dead letter queue where they can be inspected, manually replayed, or trigger an alert. Without this, permanently failed deliveries are invisible — you'd have no way to know a subscriber missed critical events.
+Jobs that exhaust all retry attempts don't silently disappear. They land in a dead letter queue where they can be inspected and manually replayed. Without this, permanently failed deliveries are invisible — you'd have no way to know a subscriber missed critical events.
 
 ### Why separate worker process instead of inline delivery?
 If delivery happened synchronously inside the POST /events handler, a slow or unresponsive subscriber would block the API. Separating the worker means the API stays fast and available regardless of subscriber behavior.

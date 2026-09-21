@@ -1,10 +1,6 @@
 const mongoose = require("mongoose");
 const { encrypt } = require("../utils/encryption");
 
-const DEFAULT_TIMEOUT_MS = Number(process.env.DEFAULT_WEBHOOK_TIMEOUT_MS) || 5000;
-const MAX_TIMEOUT_MS = Number(process.env.MAX_WEBHOOK_TIMEOUT_MS) || 30000;
-const MIN_TIMEOUT_MS = 1000;
-
 const subscriberSchema = new mongoose.Schema(
   {
     subscriberUrl: {
@@ -50,17 +46,6 @@ const subscriberSchema = new mongoose.Schema(
     isActive: {
       type: Boolean,
       default: true,
-    },
-    /**
-     * Per-subscriber HTTP delivery timeout in milliseconds.
-     * Must be between MIN_TIMEOUT_MS and MAX_TIMEOUT_MS.
-     * Defaults to DEFAULT_WEBHOOK_TIMEOUT_MS (5000ms).
-     */
-    timeoutMs: {
-      type: Number,
-      default: DEFAULT_TIMEOUT_MS,
-      min: [MIN_TIMEOUT_MS, `timeoutMs must be at least ${MIN_TIMEOUT_MS}ms`],
-      max: [MAX_TIMEOUT_MS, `timeoutMs must not exceed ${MAX_TIMEOUT_MS}ms`],
     },
   },
   { timestamps: true }

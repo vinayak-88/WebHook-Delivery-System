@@ -5,7 +5,6 @@ const Subscriber = require("../models/Subscriber");
 const logger = require("../config/logger");
 const { queueEventDeliveries } = require("../utils/eventQueue");
 const authenticateProducer = require("../middlewares/authenticateProducer");
-const { validateRegisteredEventTypes } = require("../utils/eventTypeValidator");
 
 const EVENT_TYPE_RE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
 
@@ -83,13 +82,6 @@ router.post("/", authenticateProducer, async (req, res) => {
     return res.status(403).json({
       error: `Producer is not authorized to fire event type: ${normalizedType}`,
     });
-  }
-
-  // Validate against EventType registry if active or in strict mode
-  try {
-    await validateRegisteredEventTypes(normalizedType);
-  } catch (err) {
-    return res.status(err.statusCode || 400).json({ error: err.message });
   }
 
   // Check producer-scoped idempotency

@@ -5,7 +5,6 @@ const logger = require("../config/logger");
 const authenticateProducer = require("../middlewares/authenticateProducer");
 const { generateApiKey, hashKey } = require("../utils/apiKey");
 const { validateNoSSRF } = require("../utils/ssrf");
-const { validateRegisteredEventTypes } = require("../utils/eventTypeValidator");
 
 const EVENT_TYPE_RE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
 
@@ -37,13 +36,6 @@ router.post("/register", async (req, res) => {
   }
 
   allowedEvents = allowedEvents.map((e) => e.trim());
-
-  // Validate allowedEvents against EventType registry if active
-  try {
-    await validateRegisteredEventTypes(allowedEvents);
-  } catch (err) {
-    return res.status(err.statusCode || 400).json({ error: err.message });
-  }
 
   // SSRF & protocol validation on producerUrl
   try {
@@ -111,12 +103,6 @@ router.patch("/events", authenticateProducer, async (req, res) => {
   }
 
   allowedEvents = allowedEvents.map((e) => e.trim());
-
-  try {
-    await validateRegisteredEventTypes(allowedEvents);
-  } catch (err) {
-    return res.status(err.statusCode || 400).json({ error: err.message });
-  }
 
   try {
     producer.allowedEvents = allowedEvents;

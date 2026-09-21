@@ -10,7 +10,6 @@ const webhookRoutes = require("./routes/webhooks");
 const eventRoutes = require("./routes/events");
 const deadLetterRoutes = require("./routes/deadLetters");
 const producerRouter = require("./routes/producer");
-const eventTypeRoutes = require("./routes/eventTypes");
 const requestIdMiddleware = require("./middlewares/requestId");
 const { startPendingEventRecovery } = require("./utils/eventQueue");
 const { deliveryQueue } = require("./queues/deliveryQueue");
@@ -75,7 +74,6 @@ app.use("/events", eventLimiter, eventRoutes);
 app.use("/webhooks", managementLimiter, webhookRoutes);
 app.use("/dead-letters", managementLimiter, deadLetterRoutes);
 app.use("/producers", managementLimiter, producerRouter);
-app.use("/event-types", managementLimiter, eventTypeRoutes);
 
 // Liveness check (cheap process check)
 app.get("/health", (req, res) => {

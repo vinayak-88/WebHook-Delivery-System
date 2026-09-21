@@ -1,5 +1,5 @@
 require("dotenv").config();
-const { Worker, DelayedError } = require("bullmq");
+const { Worker } = require("bullmq");
 const axios = require("axios");
 const redisConnection = require("../config/redis");
 const connectDB = require("../config/db");
@@ -8,19 +8,13 @@ const DeliveryLog = require("../models/DeliveryLog");
 const Subscriber = require("../models/Subscriber");
 const { deadLetterQueue, MAX_DELIVERY_ATTEMPTS } = require("../queues/deliveryQueue");
 const { generateSignature } = require("../utils/hmac");
-const { decryptSigningKey } = require("../utils/encryption");
+const { decrypt } = require("../utils/encryption");
 const { validateNoSSRF } = require("../utils/ssrf");
 const { assertValidDeliveryJobData } = require("../utils/jobSchema");
-const {
-  getCircuitState,
-  recordFailure,
-  recordSuccess,
-  COOLDOWN_MS,
-} = require("../utils/circuitBreaker");
-const { startDLQMonitor, stopDLQMonitor } = require("../utils/dlqMonitor");
 
 const RETRY_JITTER_MS = Number(process.env.RETRY_JITTER_MS) || 500;
-const DEFAULT_TIMEOUT_MS = Number(process.env.DEFAULT_WEBHOOK_TIMEOUT_MS) || 5000;
+// Single application-level timeout for all outbound webhook requests.
+const WEBHOOK_TIMEOUT_MS = Number(process.env.WEBHOOK_TIMEOUT_MS) || 5000;
 
 const rawConcurrency = Number(process.env.WORKER_CONCURRENCY);
 const workerConcurrency =
@@ -83,40 +77,22 @@ const processDeliveryJob = async (job) => {
     requestId,
   });
 
-  // 2. Check subscriber circuit breaker state
-  const circuit = await getCircuitState(subscriberId);
-  if (circuit.state === "open") {
-    const delayMs = Math.max(circuit.remainingCooldownMs, 1000);
-    logger.warn(
-      `Circuit open for subscriber ${subscriberId}. Delaying job ${job.id} for ${delayMs}ms`,
-      { subscriberId, delayMs },
-    );
-    if (job.token && typeof job.moveToDelayed === "function") {
-      await job.moveToDelayed(Date.now() + delayMs, job.token);
-      throw new DelayedError();
-    }
-    throw new Error(
-      `CIRCUIT_OPEN: Subscriber circuit is open (cooldown ${delayMs}ms remaining)`,
-    );
-  }
-
-  // 3. SSRF destination validation immediately before outbound request
+  // 2. SSRF destination validation immediately before outbound request
   await validateNoSSRF(subscriberUrl);
 
-  // 4. Fetch subscriber and decrypt secret
+  // 3. Fetch subscriber and decrypt secret
   const subscriber = await Subscriber.findById(subscriberId).select(
-    "signingKey isActive timeoutMs",
+    "signingKey isActive",
   );
   if (!subscriber || !subscriber.isActive) {
     throw new Error(`Subscriber ${subscriberId} is inactive or not found`);
   }
 
-  const signingKey = decryptSigningKey(subscriber.signingKey, subscriberId);
+  const signingKey = decrypt(subscriber.signingKey);
 
   const bodyBuffer = Buffer.from(JSON.stringify(payload));
   const timestamp = Date.now();
   const signature = generateSignature(bodyBuffer, signingKey, timestamp);
-  const timeoutMs = subscriber.timeoutMs || DEFAULT_TIMEOUT_MS;
 
   try {
     const response = await axios.post(subscriberUrl, bodyBuffer, {
@@ -128,12 +104,9 @@ const processDeliveryJob = async (job) => {
         "X-timestamp": String(timestamp),
         ...(requestId ? { "X-Request-Id": requestId } : {}),
       },
-      timeout: timeoutMs,
+      timeout: WEBHOOK_TIMEOUT_MS,
       maxRedirects: 0, // Prevent redirect-based SSRF bypass
     });
-
-    // Record circuit breaker success
-    await recordSuccess(subscriberId);
 
     await persistDeliveryLog(
       buildLogPayload({
@@ -157,9 +130,6 @@ const processDeliveryJob = async (job) => {
 
     return response;
   } catch (err) {
-    // Record circuit breaker failure
-    await recordFailure(subscriberId);
-
     const statusCode = err.response ? err.response.status : null;
     const responseBody = err.response
       ? JSON.stringify(err.response.data)
@@ -202,10 +172,8 @@ const deliveryWorker = new Worker("webhook-delivery", processDeliveryJob, {
   connection: redisConnection,
   concurrency: workerConcurrency,
   settings: {
-    backoffStrategy: (attemptsMade, type, err) => {
-      if (err && err.message && err.message.startsWith("CIRCUIT_OPEN")) {
-        return COOLDOWN_MS;
-      }
+    // Exponential backoff with random jitter to avoid thundering herds
+    backoffStrategy: (attemptsMade) => {
       const base = 1000 * Math.pow(2, attemptsMade - 1);
       const jitter = Math.random() * RETRY_JITTER_MS;
       return Math.round(base + jitter);
@@ -218,11 +186,6 @@ deliveryWorker.on("failed", async (job, err) => {
     logger.error("Worker job failed before BullMQ provided job context", {
       error: err.message,
     });
-    return;
-  }
-
-  // Do not escalate to DLQ if delayed by circuit breaker
-  if (err && (err.name === "DelayedError" || err.message?.startsWith("CIRCUIT_OPEN"))) {
     return;
   }
 
@@ -270,7 +233,6 @@ deliveryWorker.on("error", (err) => {
 const shutdown = async (signal) => {
   logger.info(`Received ${signal} — closing worker gracefully`);
   try {
-    stopDLQMonitor();
     await deliveryWorker.close();
     logger.info("Worker closed cleanly");
     process.exit(0);
@@ -285,7 +247,6 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 
 const startWorker = async () => {
   await connectDB();
-  startDLQMonitor();
   logger.info("Delivery worker started — waiting for jobs", {
     concurrency: workerConcurrency,
   });

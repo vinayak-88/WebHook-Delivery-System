@@ -7,13 +7,10 @@ const logger = require("../config/logger");
 const authenticateSubscriber = require("../middlewares/authenticateSubscriber");
 const { generateApiKey, hashKey } = require("../utils/apiKey");
 const { validateNoSSRF } = require("../utils/ssrf");
-const { validateRegisteredEventTypes } = require("../utils/eventTypeValidator");
 
 // Secrets shorter than 32 chars are trivially brute-forceable
 const SECRET_MIN_LENGTH = 32;
 const EVENT_TYPE_RE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
-const MIN_TIMEOUT_MS = 1000;
-const MAX_TIMEOUT_MS = 30000;
 
 // GET /webhooks - View current subscriber profile
 router.get("/", authenticateSubscriber, async (req, res) => {
@@ -23,7 +20,6 @@ router.get("/", authenticateSubscriber, async (req, res) => {
     subscriberUrl: subscriber.subscriberUrl,
     events: subscriber.events,
     isActive: subscriber.isActive,
-    timeoutMs: subscriber.timeoutMs,
     createdAt: subscriber.createdAt,
     updatedAt: subscriber.updatedAt,
   });
@@ -31,7 +27,7 @@ router.get("/", authenticateSubscriber, async (req, res) => {
 
 // POST /webhooks/register - Register a new subscriber
 router.post("/register", async (req, res) => {
-  let { subscriberUrl, events, secret, timeoutMs } = req.body;
+  let { subscriberUrl, events, secret } = req.body;
 
   if (!subscriberUrl || !subscriberUrl.trim() || !events || !secret) {
     return res.status(400).json({
@@ -57,13 +53,6 @@ router.post("/register", async (req, res) => {
 
   events = events.map((e) => e.trim());
 
-  // Validate event types against EventType registry if active
-  try {
-    await validateRegisteredEventTypes(events);
-  } catch (err) {
-    return res.status(err.statusCode || 400).json({ error: err.message });
-  }
-
   if (typeof secret !== "string") {
     return res.status(400).json({
       error: "secret must be of type string",
@@ -83,18 +72,6 @@ router.post("/register", async (req, res) => {
     return res.status(400).json({ error: err.message });
   }
 
-  // Optional timeout validation
-  let validatedTimeout = undefined;
-  if (timeoutMs !== undefined) {
-    const num = Number(timeoutMs);
-    if (!Number.isInteger(num) || num < MIN_TIMEOUT_MS || num > MAX_TIMEOUT_MS) {
-      return res.status(400).json({
-        error: `timeoutMs must be an integer between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS} ms`,
-      });
-    }
-    validatedTimeout = num;
-  }
-
   // Generate 32-byte API key and store SHA-256 hash
   const rawApiKey = generateApiKey();
   const hashedApiKey = hashKey(rawApiKey);
@@ -105,7 +82,6 @@ router.post("/register", async (req, res) => {
       events,
       apiSecret: hashedApiKey,
       secret, // Hits virtual setter: encrypts using AES-256-GCM
-      ...(validatedTimeout !== undefined ? { timeoutMs: validatedTimeout } : {}),
     });
 
     await subscriber.save();
@@ -121,7 +97,6 @@ router.post("/register", async (req, res) => {
       subscriberId: subscriber._id,
       subscriberUrl: subscriber.subscriberUrl,
       events: subscriber.events,
-      timeoutMs: subscriber.timeoutMs,
       apiKey: rawApiKey,
     });
   } catch (err) {
@@ -135,10 +110,10 @@ router.post("/register", async (req, res) => {
   }
 });
 
-// PATCH /webhooks - Update subscriber configuration (URL, events, timeoutMs)
+// PATCH /webhooks - Update subscriber configuration (URL, events)
 router.patch("/", authenticateSubscriber, async (req, res) => {
   const subscriber = req.subscriber;
-  const { subscriberUrl, events, timeoutMs } = req.body;
+  const { subscriberUrl, events } = req.body;
 
   if (
     req.body.subscriberId !== undefined ||
@@ -152,11 +127,10 @@ router.patch("/", authenticateSubscriber, async (req, res) => {
 
   if (
     subscriberUrl === undefined &&
-    events === undefined &&
-    timeoutMs === undefined
+    events === undefined
   ) {
     return res.status(400).json({
-      error: "At least one of subscriberUrl, events, or timeoutMs must be provided",
+      error: "At least one of subscriberUrl or events must be provided",
     });
   }
 
@@ -188,23 +162,7 @@ router.patch("/", authenticateSubscriber, async (req, res) => {
       });
     }
     const trimmedEvents = events.map((e) => e.trim());
-    try {
-      await validateRegisteredEventTypes(trimmedEvents);
-    } catch (err) {
-      return res.status(err.statusCode || 400).json({ error: err.message });
-    }
     subscriber.events = trimmedEvents;
-  }
-
-  // Validate timeoutMs if provided
-  if (timeoutMs !== undefined) {
-    const num = Number(timeoutMs);
-    if (!Number.isInteger(num) || num < MIN_TIMEOUT_MS || num > MAX_TIMEOUT_MS) {
-      return res.status(400).json({
-        error: `timeoutMs must be an integer between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS} ms`,
-      });
-    }
-    subscriber.timeoutMs = num;
   }
 
   try {
@@ -213,7 +171,6 @@ router.patch("/", authenticateSubscriber, async (req, res) => {
       subscriberId: subscriber._id,
       subscriberUrl: subscriber.subscriberUrl,
       events: subscriber.events,
-      timeoutMs: subscriber.timeoutMs,
     });
 
     res.json({
@@ -221,43 +178,12 @@ router.patch("/", authenticateSubscriber, async (req, res) => {
       subscriberId: subscriber._id,
       subscriberUrl: subscriber.subscriberUrl,
       events: subscriber.events,
-      timeoutMs: subscriber.timeoutMs,
     });
   } catch (err) {
     if (err.code === 11000) {
       return res.status(409).json({ error: "A subscriber with this URL already exists" });
     }
     logger.error("Failed to update subscriber", { error: err.message });
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// PATCH /webhooks/secret - Rotate subscriber webhook signing secret
-router.patch("/secret", authenticateSubscriber, async (req, res) => {
-  const subscriber = req.subscriber;
-  const newSecret = req.body.newSecret || req.body.secret;
-
-  if (typeof newSecret !== "string" || newSecret.length < SECRET_MIN_LENGTH) {
-    return res.status(400).json({
-      error: `newSecret must be a string of at least ${SECRET_MIN_LENGTH} characters`,
-    });
-  }
-
-  try {
-    // Hits the virtual setter: encrypts via AES-256-GCM before saving
-    subscriber.secret = newSecret;
-    await subscriber.save();
-
-    logger.info("Subscriber webhook secret rotated", {
-      subscriberId: subscriber._id,
-    });
-
-    res.json({
-      message:
-        "Webhook secret rotated successfully. Future webhook deliveries will be signed with the new secret.",
-    });
-  } catch (err) {
-    logger.error("Failed to rotate subscriber secret", { error: err.message });
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -284,12 +210,6 @@ router.patch("/events", authenticateSubscriber, async (req, res) => {
   }
 
   events = events.map((e) => e.trim());
-
-  try {
-    await validateRegisteredEventTypes(events);
-  } catch (err) {
-    return res.status(err.statusCode || 400).json({ error: err.message });
-  }
 
   try {
     subscriber.events = events;

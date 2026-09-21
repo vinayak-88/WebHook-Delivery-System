@@ -55,6 +55,10 @@ function encrypt(plaintext) {
  * Decrypts a string previously produced by encrypt().
  * Throws on wrong key, tampered ciphertext, or bad format.
  *
+ * Signing secrets are always stored encrypted (iv:authTag:ciphertext).
+ * A value that cannot be decrypted is a hard error — it is never
+ * treated as a plaintext secret.
+ *
  * @param {string} stored  Format: <ivHex>:<authTagHex>:<ciphertextHex>
  * @returns {string} plaintext
  */
@@ -102,57 +106,4 @@ function decrypt(stored) {
   }
 }
 
-/**
- * Returns true if a stored value looks like it was produced by encrypt().
- * This is used to detect plaintext (pre-encryption) records during migration.
- *
- * @param {string} stored
- * @returns {boolean}
- */
-function isEncrypted(stored) {
-  if (typeof stored !== 'string') return false;
-  const parts = stored.split(':');
-  if (parts.length !== 3) return false;
-  // Each part must be a non-empty valid hex string
-  return parts.every((p) => p.length > 0 && /^[0-9a-fA-F]+$/.test(p));
-}
-
-/**
- * Safely decrypts a signing key that may be either an encrypted value
- * (new format) or a legacy plaintext value.
- *
- * In production (NODE_ENV=production), plaintext values throw an error
- * to prevent operating with unprotected secrets.
- *
- * In development, plaintext values are returned as-is with a warning.
- *
- * @param {string} storedSigningKey
- * @param {string} subscriberId  For logging context only
- * @returns {string} plaintext signing key
- */
-function decryptSigningKey(storedSigningKey, subscriberId) {
-  if (isEncrypted(storedSigningKey)) {
-    return decrypt(storedSigningKey);
-  }
-
-  // Legacy plaintext value detected
-  const isProduction = process.env.NODE_ENV === 'production';
-  if (isProduction) {
-    throw new Error(
-      `Subscriber ${subscriberId} has a plaintext signingKey in production. ` +
-      'Re-register the subscriber to encrypt the secret. ' +
-      'See README for migration instructions.'
-    );
-  }
-
-  // Development: warn and return plaintext
-  const logger = require('../config/logger');
-  logger.warn(
-    'Subscriber has a plaintext signingKey (pre-encryption record). ' +
-    'Re-register the subscriber or run the migration to encrypt.',
-    { subscriberId }
-  );
-  return storedSigningKey;
-}
-
-module.exports = { encrypt, decrypt, isEncrypted, decryptSigningKey };
+module.exports = { encrypt, decrypt };

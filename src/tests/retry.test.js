@@ -14,12 +14,6 @@ jest.mock('../config/logger', () => ({
   error: jest.fn(),
 }));
 jest.mock('../config/redis', () => ({
-  mget: jest.fn().mockResolvedValue([null, null]),
-  incr: jest.fn().mockResolvedValue(1),
-  get: jest.fn().mockResolvedValue(null),
-  set: jest.fn().mockResolvedValue('OK'),
-  mset: jest.fn().mockResolvedValue('OK'),
-  del: jest.fn().mockResolvedValue(1),
   call: jest.fn().mockResolvedValue('OK'),
   on: jest.fn(),
   quit: jest.fn().mockResolvedValue('OK'),
@@ -33,21 +27,12 @@ jest.mock('../queues/deliveryQueue', () => ({
 }));
 // Mock BullMQ Worker so importing deliveryWorker doesn't hold open Redis
 // handles/timers in Jest. processDeliveryJob (the real handler) is still tested.
-jest.mock('bullmq', () => {
-  class MockDelayedError extends Error {
-    constructor() {
-      super('Delayed');
-      this.name = 'DelayedError';
-    }
-  }
-  return {
-    DelayedError: MockDelayedError,
-    Worker: jest.fn().mockImplementation(() => ({
-      on: jest.fn(),
-      close: jest.fn().mockResolvedValue(undefined),
-    })),
-  };
-});
+jest.mock('bullmq', () => ({
+  Worker: jest.fn().mockImplementation(() => ({
+    on: jest.fn(),
+    close: jest.fn().mockResolvedValue(undefined),
+  })),
+}));
 
 const axios = require('axios');
 const DeliveryLog = require('../models/DeliveryLog');
@@ -82,11 +67,10 @@ beforeEach(() => {
   jest.clearAllMocks();
   Subscriber.findById.mockReturnValue({
     select: jest.fn().mockResolvedValue({
-      // Store the secret encrypted, as the real registration path does —
+      // Stored encrypted, as the real registration path does —
       // exercises the worker's decrypt-before-sign code path.
       signingKey: encrypt(TEST_SECRET),
       isActive: true,
-      timeoutMs: 5000,
     }),
   });
 });
@@ -185,7 +169,6 @@ describe('Delivery Retry Behaviour', () => {
       select: jest.fn().mockResolvedValue({
         signingKey: encrypt(TEST_SECRET),
         isActive: true,
-        timeoutMs: 5000,
       }),
     });
 
