@@ -7,7 +7,7 @@ const crypto = require('crypto');
  * - Otherwise generates a cryptographically random UUID
  * - Attaches request ID to req.requestId
  * - Sets X-Request-Id on the response
- * - Adds requestId to all subsequent log calls through a context object
+ * - Lets handlers include req.requestId in log calls for tracing
  */
 
 const SAFE_REQUEST_ID_RE = /^[a-zA-Z0-9_\-]{1,128}$/;

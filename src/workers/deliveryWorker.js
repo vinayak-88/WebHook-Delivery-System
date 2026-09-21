@@ -196,7 +196,16 @@ const processDeliveryJob = async (job) => {
       requestId,
     });
 
-    return response;
+    // Return a small serializable summary. BullMQ JSON-serializes the return
+    // value into Redis — returning the raw Axios response (circular refs)
+    // breaks completion bookkeeping and wrongly fails the job after a
+    // successful delivery.
+    return {
+      statusCode: response.status,
+      eventId,
+      subscriberId,
+      attemptNumber,
+    };
   } catch (err) {
     const durationMs = Date.now() - attemptStartedAt;
     const statusCode = err.response ? err.response.status : null;
@@ -292,7 +301,7 @@ deliveryWorker.on("failed", async (job, err) => {
           failedAt: new Date().toISOString(),
         },
         {
-          jobId: `dead-letter:${job.id}`,
+          jobId: `dead-letter-${job.id}`,
         },
       );
     } catch (deadLetterErr) {

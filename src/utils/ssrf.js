@@ -5,7 +5,7 @@ const net = require('net');
  * List of private/reserved CIDR ranges that should not be reachable
  * via outbound webhook deliveries (SSRF protection).
  *
- * Each entry is { network: Buffer, mask: Buffer, bits: number }.
+ * Each entry is { networkInt, maskInt, bits } (see parseCIDR).
  */
 const BLOCKED_CIDRS = [
   // IPv4 loopback

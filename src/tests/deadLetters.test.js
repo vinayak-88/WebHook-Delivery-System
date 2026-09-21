@@ -19,7 +19,7 @@ const Event = require('../models/Event');
 const deadLetterRoutes = require('../routes/deadLetters');
 
 const DLQ_JOB = {
-  id: 'dead-letter:event:evt-1:subscriber:sub-1',
+  id: 'dead-letter-event-evt-1-subscriber-sub-1',
   data: {
     eventId: '507f1f77bcf86cd799439011',
     subscriberId: '507f191e810c19729de860ea',
@@ -76,7 +76,7 @@ describe('Dead-letter routes (admin-authenticated)', () => {
   it('replays a single job and tracks it on the parent event (202)', async () => {
     deadLetterQueue.getJob.mockResolvedValueOnce(DLQ_JOB);
     deliveryQueue.getJob.mockResolvedValueOnce(null);
-    deliveryQueue.add.mockResolvedValueOnce({ id: `replay:${DLQ_JOB.id}` });
+    deliveryQueue.add.mockResolvedValueOnce({ id: `replay-${DLQ_JOB.id}` });
 
     const res = await fetch(
       `${baseUrl}/dead-letters/${encodeURIComponent(DLQ_JOB.id)}/replay`,
@@ -93,13 +93,13 @@ describe('Dead-letter routes (admin-authenticated)', () => {
         lastReplayedAt: expect.any(Date),
       })
     );
-    expect(body.replayJobId).toBe(`replay:${DLQ_JOB.id}`);
+    expect(body.replayJobId).toBe(`replay-${DLQ_JOB.id}`);
   });
 
   it('returns 409 when a replay for the job is already active', async () => {
     deadLetterQueue.getJob.mockResolvedValueOnce(DLQ_JOB);
     deliveryQueue.getJob.mockResolvedValueOnce({
-      id: `replay:${DLQ_JOB.id}`,
+      id: `replay-${DLQ_JOB.id}`,
       getState: async () => 'active',
     });
 

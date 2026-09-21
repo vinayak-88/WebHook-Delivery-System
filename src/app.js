@@ -5,6 +5,11 @@ const rateLimit = require("express-rate-limit");
 const { RedisStore } = require("rate-limit-redis");
 const connectDB = require("./config/db");
 const redisConnection = require("./config/redis");
+const {
+  rateLimitRedisConnection,
+  sendRateLimitCommand,
+  registerRateLimitStore,
+} = require("./config/rateLimitRedis");
 const logger = require("./config/logger");
 const webhookRoutes = require("./routes/webhooks");
 const eventRoutes = require("./routes/events");
@@ -42,30 +47,40 @@ app.use(
   }),
 );
 
-// Redis-backed rate limiting
-const createRedisStore = (prefix) => {
+// Redis-backed rate limiting on a dedicated bounded connection.
+// The BullMQ connection (maxRetriesPerRequest: null) would wait indefinitely
+// during an outage; this one fails fast so requests get a deterministic
+// fail-closed 503 (see sendRateLimitCommand) instead of hanging.
+const createRedisStore = (prefix, windowMs) => {
   // Use memory store in test environment to avoid open Redis connection handles during testing
   if (process.env.NODE_ENV === "test") {
     return undefined;
   }
-  return new RedisStore({
-    sendCommand: (...args) => redisConnection.call(...args),
+  const store = new RedisStore({
+    sendCommand: (...args) => sendRateLimitCommand(...args),
     prefix: `rl:${prefix}:`,
   });
+  // Re-load Lua scripts on (re)connect: express-rate-limit inits the store
+  // once at setup, which may happen before Redis is reachable.
+  registerRateLimitStore(store, windowMs);
+  return store;
 };
 
+const EVENT_LIMITER_WINDOW_MS = 60 * 1000; // 1 minute
+const MGMT_LIMITER_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+
 const eventLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
+  windowMs: EVENT_LIMITER_WINDOW_MS,
   max: 100,
-  store: createRedisStore("events"),
+  store: createRedisStore("events", EVENT_LIMITER_WINDOW_MS),
   message: { error: "Too many requests, slow down" },
   passOnStoreError: false, // Fail closed if Redis is down
 });
 
 const managementLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: MGMT_LIMITER_WINDOW_MS,
   max: 50,
-  store: createRedisStore("mgmt"),
+  store: createRedisStore("mgmt", MGMT_LIMITER_WINDOW_MS),
   message: { error: "Too many requests, slow down" },
   passOnStoreError: false, // Fail closed if Redis is down
 });
@@ -81,11 +96,20 @@ app.get("/health", (req, res) => {
 });
 
 // Readiness check (verifies MongoDB and Redis connectivity)
+// The Redis ping is raced against a timeout: the shared BullMQ connection
+// retries indefinitely by design, and readiness must answer fast either way.
+const READY_REDIS_TIMEOUT_MS = 2000;
+
 app.get("/ready", async (req, res) => {
   const mongoConnected = mongoose.connection.readyState === 1;
   let redisConnected = false;
   try {
-    const pong = await redisConnection.ping();
+    const pong = await Promise.race([
+      redisConnection.ping(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("redis ping timeout")), READY_REDIS_TIMEOUT_MS)
+      ),
+    ]);
     redisConnected = pong === "PONG";
   } catch {
     redisConnected = false;
@@ -169,8 +193,9 @@ const startServer = async () => {
         // Close BullMQ queue
         await deliveryQueue.close();
 
-        // Close Redis connection
+        // Close Redis connections (BullMQ + dedicated rate-limit)
         await redisConnection.quit().catch(() => {});
+        await rateLimitRedisConnection.quit().catch(() => {});
 
         // Close DB connection
         await mongoose.connection.close();

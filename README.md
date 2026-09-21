@@ -288,7 +288,7 @@ Replaying updates the parent event's `replayCount`, `lastReplayedAt`, and `lastR
 ### Security and limits
 - Producer/subscriber API keys are SHA-256 hashed at rest; signing secrets are AES-256-GCM encrypted at rest.
 - Subscriber URLs pass DNS-based SSRF checks (loopback, private, link-local/metadata, and IPv6 ranges blocked; `DISABLE_SSRF_CHECK=true` only for local dev).
-- JSON bodies limited by `BODY_LIMIT` (`413` when exceeded); Redis-backed rate limiting (100 req/min on `/events`, 50 per 15 min on management routes, fail-closed); all error responses are `{ "error": "..." }` with no stack traces in production.
+- JSON bodies limited by `BODY_LIMIT` (`413` when exceeded); Redis-backed rate limiting on a dedicated connection (100 req/min on `/events`, 50 per 15 min on management routes, fail-closed); rate-limit Redis operations time out after `RATE_LIMIT_REDIS_TIMEOUT_MS` (default 1000ms), so a Redis outage returns a bounded `503` instead of hanging — BullMQ keeps its own separate connection with its required unbounded semantics; all error responses are `{ "error": "..." }` with no stack traces in production.
 
 ### Environment variables
 | Variable | Purpose | Default |
@@ -300,6 +300,7 @@ Replaying updates the parent event's `replayCount`, `lastReplayedAt`, and `lastR
 | `WEBHOOK_TIMEOUT_MS` | Global outbound delivery timeout | `5000` |
 | `MAX_DELIVERY_RESPONSE_BODY_CHARS` | Max subscriber response text kept per DeliveryLog | `8192` |
 | `WORKER_CONCURRENCY` / `RETRY_JITTER_MS` | Worker concurrency / backoff jitter | `5` / `500` |
+| `RATE_LIMIT_REDIS_TIMEOUT_MS` | Upper bound per rate-limit Redis round-trip (fail-closed 503 past it) | `1000` |
 | `BODY_LIMIT` | Max JSON body size | `16kb` |
 | `RECOVERY_INTERVAL_MS` / `RECOVERY_BATCH_SIZE` | Pending-event recovery loop | `5000` / `25` |
 
@@ -377,7 +378,7 @@ Tests cover:
 - SSRF blocking, body-size limits, health/readiness, request IDs
 
 ### Known limitation — single-instance recovery
-The pending-event recovery loop uses process-local coordination and is designed around a single API instance. Running multiple API replicas would need distributed coordination (or an explicit decision about which instance runs recovery) before horizontal scaling.
+The pending-event recovery loop uses process-local coordination and is designed around a single API instance. Running multiple API replicas would need distributed coordination (or an explicit decision about which instance runs recovery) before horizontal scaling. Also note: if Redis itself is down, the rate limiter fails closed with a bounded `503`, so requests never reach event persistence — recovery covers queue failures after the limiter, not a full Redis outage at ingress.
 
 ---
 
@@ -388,7 +389,8 @@ webhook-delivery-system/
 │   ├── app.js                 # Express setup, health/ready, error handling
 │   ├── config/
 │   │   ├── db.js              # MongoDB connection
-│   │   ├── redis.js           # Redis + IORedis connection
+│   │   ├── redis.js           # Redis connection for BullMQ
+│   │   ├── rateLimitRedis.js  # Dedicated bounded Redis client for rate limiting
 │   │   └── logger.js          # Winston structured logging
 │   ├── middlewares/
 │   │   ├── authenticateProducer.js    # Producer x-api-key auth

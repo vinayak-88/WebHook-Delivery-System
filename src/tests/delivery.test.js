@@ -181,7 +181,7 @@ describe('Outbound request safeguards', () => {
 
 describe('DLQ escalation', () => {
   const dlqJob = (attemptsMade) => ({
-    id: 'event:507f1f77bcf86cd799439011:subscriber:507f191e810c19729de860ea',
+    id: 'event-507f1f77bcf86cd799439011-subscriber-507f191e810c19729de860ea',
     attemptsMade,
     data: {
       eventId: '507f1f77bcf86cd799439011',
@@ -201,7 +201,7 @@ describe('DLQ escalation', () => {
         failureReason: expect.stringContaining('Permanent delivery failure'),
         failedAt: expect.any(String),
       }),
-      expect.objectContaining({ jobId: expect.stringContaining('dead-letter:') })
+      expect.objectContaining({ jobId: expect.stringContaining('dead-letter-') })
     );
   });
 

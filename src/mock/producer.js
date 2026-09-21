@@ -21,8 +21,11 @@ const SHARED_SECRET =
 
 // Step 1: Register a producer (event emitter) and get its management API key
 const registerProducer = async () => {
+  // NOTE: producerUrl is an identifier only (never dialed), but it must pass
+  // the API's URL validation, which requires a dotted hostname. With
+  // DISABLE_SSRF_CHECK=true (demo), no DNS resolution is performed.
   const res = await axios.post(`${BASE_URL}/producers/register`, {
-    producerUrl: 'http://localhost:5000/mock-producer',
+    producerUrl: 'http://mock-producer.local:5000/mock-producer',
     allowedEvents: ['payment.success', 'payment.failed', 'order.created'],
   })
   console.log('[Producer] Producer registered:', {

@@ -55,7 +55,7 @@ router.post('/:jobId/replay', async (req, res) => {
     }
 
     // Deterministic job ID — prevents double-delivery if replay is called twice before the first replay completes
-    const replayJobId = `replay:${deadLetterJob.id}`;
+    const replayJobId = `replay-${deadLetterJob.id}`;
 
     // Check if a replay is already active or waiting
     const existingReplayJob = await deliveryQueue.getJob(replayJobId);

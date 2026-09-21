@@ -40,7 +40,7 @@ describe('eventQueue utility', () => {
 
   it('builds deterministic job ids per event/subscriber pair', () => {
     expect(buildJobId(VALID_EVENT_ID, VALID_SUB_ID))
-      .toBe(`event:${VALID_EVENT_ID}:subscriber:${VALID_SUB_ID}`);
+      .toBe(`event-${VALID_EVENT_ID}-subscriber-${VALID_SUB_ID}`);
   });
 
   it('queues delivery jobs and marks the event as queued', async () => {
@@ -69,7 +69,7 @@ describe('eventQueue utility', () => {
           requestId: 'req-abc',
         },
         opts: {
-          jobId: `event:${VALID_EVENT_ID}:subscriber:${VALID_SUB_ID}`,
+          jobId: `event-${VALID_EVENT_ID}-subscriber-${VALID_SUB_ID}`,
         },
       },
     ]);

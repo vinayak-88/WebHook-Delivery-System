@@ -7,8 +7,9 @@ const PENDING_QUEUE_STATUS = "pending";
 const QUEUED_QUEUE_STATUS = "queued";
 const NO_SUBSCRIBERS_QUEUE_STATUS = "no_subscribers";
 
+// BullMQ forbids ":" in custom job IDs, so deterministic IDs use "-".
 const buildJobId = (eventId, subscriberId) =>
-  `event:${eventId}:subscriber:${subscriberId}`;
+  `event-${eventId}-subscriber-${subscriberId}`;
 
 const buildDeliveryJobs = (event) =>
   event.deliveryTargets.map((target) => {

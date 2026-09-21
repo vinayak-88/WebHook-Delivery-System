@@ -11,6 +11,15 @@ jest.mock('../config/redis', () => ({
   on: jest.fn(),
   quit: jest.fn().mockResolvedValue('OK'),
 }));
+jest.mock('../config/rateLimitRedis', () => ({
+  rateLimitRedisConnection: {
+    on: jest.fn(),
+    quit: jest.fn().mockResolvedValue('OK'),
+  },
+  sendRateLimitCommand: jest.fn().mockResolvedValue('OK'),
+  registerRateLimitStore: jest.fn(),
+  RATE_LIMIT_REDIS_TIMEOUT_MS: 1000,
+}));
 jest.mock('../config/logger', () => ({
   info: jest.fn(),
   warn: jest.fn(),
