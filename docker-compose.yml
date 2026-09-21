@@ -11,7 +11,12 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - NODE_ENV=production
-      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - WEBHOOK_ENCRYPTION_KEY=${WEBHOOK_ENCRYPTION_KEY}
+      - ADMIN_API_KEY=${ADMIN_API_KEY}
+      # Demo only: the mock subscriber runs on the host, which SSRF
+      # protection blocks. Defaults to false (protection enabled);
+      # set DISABLE_SSRF_CHECK=true in .env for the local demo only.
+      - DISABLE_SSRF_CHECK=${DISABLE_SSRF_CHECK:-false}
       - DISABLE_RECOVERY=false
     depends_on:
       mongo:
@@ -30,7 +35,10 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - NODE_ENV=production
-      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - WEBHOOK_ENCRYPTION_KEY=${WEBHOOK_ENCRYPTION_KEY}
+      - ADMIN_API_KEY=${ADMIN_API_KEY}
+      # Same demo-only SSRF bypass as the API (see above). Default: enabled protection.
+      - DISABLE_SSRF_CHECK=${DISABLE_SSRF_CHECK:-false}
       - DISABLE_RECOVERY=false
     depends_on:
       mongo:

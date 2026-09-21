@@ -1,0 +1,17 @@
+# Never bake local secrets or dev-only flags into the image.
+# Compose supplies runtime config via `environment:` instead.
+.env
+.env.*
+
+# Dependencies are installed inside the image.
+node_modules/
+
+# Runtime state — mounted as a volume in Compose.
+logs/
+*.log
+
+# Build context hygiene.
+.git
+.gitignore
+coverage/
+.nyc_output

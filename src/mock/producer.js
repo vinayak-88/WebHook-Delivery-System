@@ -3,6 +3,13 @@ const axios = require('axios')
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000'
 const DELIVERY_WAIT_MS = Number(process.env.DELIVERY_WAIT_MS) || 20000
 
+// URL the worker will POST deliveries to.
+// - Manual flow (API + worker on host): default http://localhost:4000/receive
+// - Docker flow (API + worker in containers, mocks on host):
+//   SUBSCRIBER_URL=http://host.docker.internal:4000/receive
+//   (`localhost` inside a container means the container itself, not the host.)
+const SUBSCRIBER_URL = process.env.SUBSCRIBER_URL || 'http://localhost:4000/receive'
+
 // Webhook signing secret shared with the mock subscriber (min 32 chars).
 // Must match the `secret` used when registering the subscriber below.
 const SHARED_SECRET =
@@ -27,7 +34,7 @@ const registerProducer = async () => {
 // Step 2: Register a subscriber (run once, then comment out)
 const registerSubscriber = async () => {
   const res = await axios.post(`${BASE_URL}/webhooks/register`, {
-    subscriberUrl: 'http://localhost:4000/receive',
+    subscriberUrl: SUBSCRIBER_URL,
     events: ['payment.success', 'payment.failed', 'order.created'],
     secret: SHARED_SECRET,
   })

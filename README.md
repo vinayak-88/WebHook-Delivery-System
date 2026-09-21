@@ -309,11 +309,22 @@ Replaying updates the parent event's `replayCount`, `lastReplayedAt`, and `lastR
 
 ### Option 1 — Docker (recommended)
 ```bash
+# Configure from the template (Compose reads WEBHOOK_ENCRYPTION_KEY and
+# ADMIN_API_KEY from this file — no real secrets are committed)
+cp .env.example .env
+
+# Local demo only: mocks run on the host, which SSRF protection blocks by
+# default — allow it for the demo (never in production)
+# In .env, set: DISABLE_SSRF_CHECK=true
+
 # Start everything: API + Worker + MongoDB + Redis
 docker-compose up --build
 
-# In a separate terminal, register and fire events
-npm run mock:producer
+# In a separate terminal: mock subscriber on the host, then fire events.
+# SUBSCRIBER_URL uses host.docker.internal because `localhost` inside the
+# worker container means the container itself, not your machine.
+npm run mock:subscriber
+SUBSCRIBER_URL=http://host.docker.internal:4000/receive npm run mock:producer
 
 # Stop and clean up the stack
 docker-compose down
