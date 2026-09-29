@@ -9,10 +9,15 @@
 > (`POST /dead-letters/:jobId/replay`) and its `Event` replay-tracking fields remain.
 > A later quality pass added failure classification (permanent `4xx` and deterministic
 > pre-delivery failures fail fast via BullMQ `UnrecoverableError`; transient
-> DB/network errors retry), `durationMs` delivery timing, and consistent
-> `{ "error": ... }` API responses.
-> A few older sections below still describe the pre-simplification system; where a
-> section conflicts with this note, this note wins.
+> DB/network errors retry), `durationMs` delivery timing, consistent
+> `{ "error": ... }` API responses, producer-scoped ingestion idempotency
+> (`Idempotency-Key` header or `idempotencyKey` body field), MongoDB indexes
+> (`Event { queueStatus, createdAt }`, `Event { producerId, idempotencyKey }`
+> sparse-unique, `DeliveryLog { subscriberId, createdAt }`), Redis-backed rate
+> limiting on a dedicated bounded connection, DLQ admin auth
+> (`X-Admin-Api-Key`), `GET /ready` readiness, `X-Request-Id` tracing, and
+> `Event` replay-tracking fields (`replayCount`, `lastReplayedAt`,
+> `lastReplayJobId`) updated on DLQ replay.
 
 ## 1. Project Overview
 
@@ -37,8 +42,9 @@ The system is partitioned into two independent runtime processes: the **API Serv
             ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                      Express API Server                     │
-│  - In-memory rate limiting (100 req/min)                    │
+│  - Redis-backed rate limiting (100 req/min, dedicated conn) │
 │  - Producer authentication (SHA-256 API key) & event authz  │
+│  - Producer-scoped idempotency (Idempotency-Key header/body)│
 │  - Active subscriber matching (Subscriber.events)           │
 │  - Persist Event (deliveryTargets snapshot, status: pending)│
 │  - Enqueue delivery jobs to BullMQ (deterministic job IDs)  │
@@ -58,20 +64,22 @@ The system is partitioned into two independent runtime processes: the **API Serv
 ┌──────────────┴──────────────────────────────────────────────┐
 │                    Delivery Worker Process                  │
 │  - Concurrency: configurable (default 5 concurrent jobs)    │
+│  - Validates job schema + SSRF check before delivery        │
 │  - Fetches subscriber signingKey & isActive fresh from DB   │
 │  - Signs bodyBuffer + timestamp using HMAC-SHA256           │
-│  - HTTP POST to subscriberUrl (5000ms timeout)              │
-│  - Persist DeliveryLog (status, body, attempt, latency)     │
-│  - BullMQ retry on failure (exponential backoff, 5 attempts)│
+│  - HTTP POST to subscriberUrl (WEBHOOK_TIMEOUT_MS, 5000ms)  │
+│  - Persist DeliveryLog (status, body, attempt, durationMs)  │
+│  - BullMQ retry on transient failure (backoff+jitter, 5 max)│
+│  - Permanent 4xx / pre-delivery failures → UnrecoverableError│
 └──────────────────────────────┬──────────────────────────────┘
                                │
-               [All 5 attempts exhausted]
+               [Permanent failure OR all 5 attempts exhausted]
                                │
                                ▼
                       ┌─────────────────┐
                       │ Dead Letter Q   │
                       │  (BullMQ Queue) │
-                      │webhook-dead-lttr│
+                      │webhook-dead-letter│
                       └─────────────────┘
                                │
                       Replay via API:
@@ -107,24 +115,25 @@ The system is partitioned into two independent runtime processes: the **API Serv
 
 ### Step 4: Worker Job Processing
 1. The delivery worker pops a job from the `webhook-delivery` queue.
-2. It extracts `{ eventId, subscriberId, subscriberUrl, payload }` from `job.data`.
+2. It extracts `{ eventId, subscriberId, subscriberUrl, payload }` from `job.data` after schema validation, then runs a pre-delivery SSRF check on `subscriberUrl`.
 3. It performs a fresh database lookup: `Subscriber.findById(subscriberId).select('signingKey isActive')`.
-   - If the subscriber no longer exists or `isActive === false`, the worker throws an error, causing BullMQ to fail the attempt.
+   - If the subscriber no longer exists or `isActive === false`, the worker persists a pre-delivery `DeliveryLog` and throws `UnrecoverableError`, failing fast to the DLQ.
 4. It prepares the delivery payload:
    - Serializes payload: `bodyBuffer = Buffer.from(JSON.stringify(payload))`.
    - Generates millisecond timestamp: `timestamp = Date.now()`.
-   - Computes HMAC-SHA256 signature over `${timestamp}.` + `bodyBuffer` using `subscriber.signingKey`.
+   - Decrypts `subscriber.signingKey` and computes HMAC-SHA256 over `${timestamp}.` + `bodyBuffer`.
 5. Outgoing HTTP POST:
-   - Uses Axios to POST `bodyBuffer` to `subscriberUrl` with a 5000ms timeout.
+   - Uses Axios to POST `bodyBuffer` to `subscriberUrl` with the global `WEBHOOK_TIMEOUT_MS` timeout and `maxRedirects: 0`.
    - Headers sent:
      - `Content-Type: application/json`
      - `X-Webhook-Signature: <hexSignature>`
      - `X-Webhook-Event-Id: <eventId>`
      - `X-Webhook-Attempt: <attemptNumber>`
      - `X-timestamp: <timestampString>`
+     - `X-Request-Id: <requestId>` (when present)
 6. Logging & Completion:
-   - On HTTP 2xx: Persists a `DeliveryLog` record (`success: true`, `statusCode`, `responseBody`), logs success, and BullMQ marks the job completed.
-   - On HTTP 4xx/5xx or network timeout/error: Persists a `DeliveryLog` record (`success: false`, `statusCode` or `null`, `errorMessage`), logs a warning, and rethrows the error.
+   - On HTTP 2xx: Persists a `DeliveryLog` record (`success: true`, `statusCode`, `responseBody`, `durationMs`), logs success, and BullMQ marks the job completed.
+   - On HTTP 4xx/5xx or network timeout/error: Persists a `DeliveryLog` record (`success: false`, `statusCode` or `null`, `errorMessage`, `durationMs`), logs a warning, and either throws `UnrecoverableError` (permanent `4xx`) or rethrows for BullMQ retry.
 
 ### Step 5: Retry & Dead Letter Queue (DLQ)
 1. BullMQ catches the rethrown error and checks `job.attemptsMade`.
@@ -207,11 +216,10 @@ webhook-delivery-system/
 ├── .env                           # Local environment variables (gitignored)
 ├── .env.example                   # Environment variable template
 ├── .gitignore
-├── Dockerfile                     # Multi-stage production container build
+├── Dockerfile                     # Production container build (node:20-alpine)
 ├── docker-compose.yml             # Docker service definitions (app, worker, mongo, redis)
-├── gaps.md                        # Architectural gaps and design notes
-├── LEFT.md                        # Unimplemented features list
 ├── package.json                   # Dependencies and npm scripts
+├── context.md                     # This file — implementation reference
 └── README.md                      # Project documentation
 ```
 
@@ -267,6 +275,8 @@ Tracks receiving webhook endpoints.
 
 ### `Event` (`src/models/Event.js`)
 Stores incoming webhook events and delivery target snapshots.
+- `producerId` (ObjectId, ref `'Producer'`, optional for backward compat, indexed): Owning producer; used for `GET /events/:id` ownership checks and idempotency scope.
+- `idempotencyKey` (String, trimmed, default `null`): Producer-supplied key from `Idempotency-Key` header or `idempotencyKey` body field.
 - `type` (String, required, trimmed): Event name in `noun.verb` notation.
 - `payload` (Mongoose.Schema.Types.Mixed, required): Arbitrary JSON payload.
 - `deliveryTargets` (Array of Subdocuments, `_id: false`, default `[]`): Snapshot of matching subscribers at ingestion time:
@@ -280,10 +290,14 @@ Stores incoming webhook events and delivery target snapshots.
   - `message` (String, default `null`)
   - `code` (String, default `null`, e.g., `ECONNREFUSED`)
   - `occurredAt` (Date, default `null`)
+- `replayCount` (Number, default `0`), `lastReplayedAt` (Date, default `null`), `lastReplayJobId` (String, default `null`): DLQ replay tracking, updated on `POST /dead-letters/:jobId/replay`.
+- `requestId` (String, default `null`): `X-Request-Id` from the ingestion request, propagated through jobs, worker logs, and delivery headers.
 - `timestamps`: `createdAt`, `updatedAt`.
 - **Indexes:**
-  - `_id_` (default primary key).
-  - *Note:* There is currently **no index** on `queueStatus` or `createdAt` in the schema.
+  - `_id_` (default primary key)
+  - `producerId_1` (single-field index via schema `index: true`)
+  - `{ queueStatus: 1, createdAt: 1 }` (compound index for the recovery-loop scan `find({ queueStatus: 'pending' }).sort({ createdAt: 1 })`)
+  - `{ producerId: 1, idempotencyKey: 1 }` sparse-unique with `partialFilterExpression: { idempotencyKey: { $ne: null } }` (producer-scoped ingestion idempotency; `null` keys excluded)
 
 ### `DeliveryLog` (`src/models/DeliveryLog.js`)
 Immutable audit log for each individual delivery attempt.
@@ -292,28 +306,35 @@ Immutable audit log for each individual delivery attempt.
 - `subscriberUrl` (String, required): Delivery URL.
 - `attemptNumber` (Number, required): Attempt sequence (1 through 5).
 - `statusCode` (Number, default `null`): HTTP response code returned by subscriber (`null` on network errors).
-- `responseBody` (String, default `null`): Stringified subscriber response body.
+- `responseBody` (String, default `null`): Stringified subscriber response body, truncated to `MAX_DELIVERY_RESPONSE_BODY_CHARS` (default 8192) with `...[truncated]`.
 - `success` (Boolean, required): `true` if HTTP status is 2xx, `false` otherwise.
 - `errorMessage` (String, default `null`): Error message on network failures or Axios exceptions.
-- `timestamps`: `createdAt`, `updatedAt`.
+- `durationMs` (Number, default `null`): Elapsed time of the outbound HTTP attempt (success and failure).
+- `requestId` (String, default `null`): Propagated tracing ID.
+- `timestamps`: `createdAt` only (`{ timestamps: { createdAt: true, updatedAt: false } }` — append-only, no `updatedAt`).
 - **Indexes:**
-  - `_id_` (default primary key).
-  - *Note:* There is **no compound index** on `{ subscriberId: 1, createdAt: -1 }`.
+  - `_id_` (default primary key)
+  - `{ subscriberId: 1, createdAt: -1 }` (compound index for `GET /webhooks/logs` sorted newest-first)
 
 ---
 
 ## 8. Event Ingestion
 
-- **Endpoint:** `POST /events`
+- **Endpoints:** `POST /events` (ingest), `GET /events/:id` (producer-scoped status lookup; `403` if the caller does not own the event, `404` if missing, `400` on malformed ObjectId).
 - **Authentication:** Requires `x-api-key` header matching an active `Producer` record.
 - **Payload Validation:**
-  - `type` and `payload` are mandatory.
+  - `type` and `payload` are mandatory (`payload` must not be `null`/`undefined`).
   - `type` must match `/^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/` (e.g., `payment.success`, `order.item.created`).
   - The authenticated producer must have `type` listed in its `allowedEvents`. If not, returns `403 Forbidden`.
+- **Idempotency (producer-scoped):**
+  - Key source: `Idempotency-Key` header or `idempotencyKey` body field (trimmed; empty → treated as absent).
+  - If a matching `{ producerId, idempotencyKey }` event exists: same `type` + deep-equal `payload` → `200 { message: "Event already accepted (idempotent replay)", eventId, queueStatus, jobsQueued, isDuplicate: true }`; different `type`/`payload` → `409 Conflict`.
+  - A `11000` duplicate-key race on `Event.create` is caught and resolved to the same `200` idempotent response.
+  - Enforced by the sparse-unique `{ producerId: 1, idempotencyKey: 1 }` index.
 - **Subscriber Matching:**
   - Performs an array-contains query: `Subscriber.find({ events: type, isActive: true })`.
 - **Persistence & Delivery Targets:**
-  - Creates the `Event` record immediately in MongoDB with a snapshot of matched subscribers in `deliveryTargets`.
+  - Creates the `Event` record immediately in MongoDB with `producerId`, `idempotencyKey`, `requestId` (`req.requestId`), and a snapshot of matched subscribers in `deliveryTargets`.
   - Storing the snapshot guarantees that even if a subscriber updates its event subscriptions or is deleted later, this specific event delivery is bound to the subscribers active at the exact time the event was produced.
 - **Queue Handoff:**
   - Calls `queueEventDeliveries(event)`:
@@ -327,10 +348,17 @@ Immutable audit log for each individual delivery attempt.
 
 - **Endpoint:** `POST /webhooks/register`
   - Body: `{ subscriberUrl, events, secret }`
-  - Validation: `secret` must be a string of at least 32 characters; `events` must be a non-empty array of valid `noun.verb` strings; `subscriberUrl` must be a valid URL (enforces `https:` in `NODE_ENV === 'production'`).
+  - Validation: `secret` must be a string of at least 32 characters; `events` must be a non-empty array of valid `noun.verb` strings; `subscriberUrl` passes DNS-based SSRF validation (`src/utils/ssrf.js`; enforces `https:` in `NODE_ENV === 'production'`).
   - Key Generation: Generates a 32-byte hex API key (`apiKey`), hashes it with SHA-256 (`apiSecret`).
   - Secret Storage: Encrypts `secret` with AES-256-GCM before storing in `signingKey` in MongoDB via virtual setter.
   - Response (`201 Created`): Returns `subscriberId`, `subscriberUrl`, `events`, and the plaintext `apiKey`.
+- **Endpoint:** `GET /webhooks`
+  - Authentication: `authenticateSubscriber` via `x-api-key`.
+  - Returns the caller profile: `subscriberId`, `subscriberUrl`, `events`, `isActive`, `createdAt`, `updatedAt`.
+- **Endpoint:** `PATCH /webhooks`
+  - Authentication: `authenticateSubscriber` via `x-api-key`.
+  - Body: `{ subscriberUrl?, events? }` (at least one required; rejects `subscriberId`/`apiSecret`/`signingKey` with `400`).
+  - `subscriberUrl` re-passes SSRF validation; duplicate URLs → `409`. Response: `{ message: "Subscriber updated successfully", subscriberId, subscriberUrl, events }`.
 - **Endpoint:** `PATCH /webhooks/events`
   - Authentication: `authenticateSubscriber` via `x-api-key`.
   - Body: `{ events }` (validated non-empty array of `noun.verb` strings).
@@ -341,7 +369,7 @@ Immutable audit log for each individual delivery attempt.
 - **Endpoint:** `GET /webhooks/logs`
   - Authentication: `authenticateSubscriber` via `x-api-key`.
   - Query parameters: `page` (default 1), `limit` (default 50, max 100).
-  - Queries `DeliveryLog.find({ subscriberId: req.subscriber._id })`, sorted `{ createdAt: -1 }`, populating `eventId` fields (`type`, `payload`, `createdAt`).
+  - Queries `DeliveryLog.find({ subscriberId: req.subscriber._id })`, sorted `{ createdAt: -1 }`, populating `eventId` fields (`type`, `payload`, `createdAt`, `requestId`). Response includes `subscriberId`, `total`, `page`, `limit`, `pages`, `logs`.
 
 ---
 
@@ -368,16 +396,16 @@ Immutable audit log for each individual delivery attempt.
 
 ## 11. Delivery Process
 
-1. **Job Data Ingestion:** The worker extracts `{ eventId, subscriberId, subscriberUrl, payload }` from `job.data`. Note: Webhook signing secrets are **never** stored in job data.
-2. **Fresh Subscriber Lookup:** The worker queries MongoDB: `Subscriber.findById(subscriberId).select("signingKey isActive")`.
-   - If the subscriber record is missing or `isActive === false`, the worker throws an error: `Subscriber <subscriberId> is inactive or not found`.
+1. **Job Data Ingestion:** The worker extracts `{ eventId, subscriberId, subscriberUrl, payload }` from `job.data` after `assertValidDeliveryJobData` schema validation (ObjectId format, URL shape, payload present). Note: Webhook signing secrets are **never** stored in job data.
+2. **Fresh Subscriber Lookup:** The worker runs `validateNoSSRF(subscriberUrl)` immediately before dialing, then queries MongoDB: `Subscriber.findById(subscriberId).select("signingKey isActive")`. Transient DB errors propagate so BullMQ retries; only the resolved outcome below is classified permanent.
+   - If the subscriber record is missing or `isActive === false`, the worker persists a pre-delivery `DeliveryLog` (`statusCode/responseBody/durationMs: null`) and throws `UnrecoverableError: Subscriber <subscriberId> is inactive or not found` (fail-fast to DLQ, no retry burn).
 3. **Payload Serialization:**
    - `bodyBuffer = Buffer.from(JSON.stringify(payload))`
    - `timestamp = Date.now()`
 4. **Signature Calculation:**
-   - Decrypts the AES-256-GCM encrypted `subscriber.signingKey`, then computes the HMAC-SHA256 signature over `${timestamp}.` concatenated with `bodyBuffer`.
+   - Decrypts the AES-256-GCM encrypted `subscriber.signingKey`, then computes the HMAC-SHA256 signature over `${timestamp}.` concatenated with `bodyBuffer`. Decrypt/serialize failures also log a pre-delivery record and throw `UnrecoverableError` (deterministic, never retried).
 5. **HTTP POST Request:**
-   - Client: Axios
+   - Client: Axios with `maxRedirects: 0` (no redirect-based SSRF bypass)
    - URL: `subscriberUrl`
    - Body: Raw `bodyBuffer`
    - Timeout: Global `WEBHOOK_TIMEOUT_MS` (default `5000ms`)
@@ -387,10 +415,11 @@ Immutable audit log for each individual delivery attempt.
      - `X-Webhook-Event-Id: <eventId>`
      - `X-Webhook-Attempt: <attemptNumber>` (derived from `job.attemptsMade + 1`)
      - `X-timestamp: <timestampString>`
+     - `X-Request-Id: <requestId>` (only if present on the job)
 6. **Result Persistence:**
-   - Success (`2xx`): Creates `DeliveryLog` with `success: true`, `statusCode: response.status`, `responseBody: JSON.stringify(response.data)`. Returns a small serializable summary (`{ statusCode, eventId, subscriberId, attemptNumber }`) — never the raw Axios response, whose circular references would break BullMQ completion bookkeeping and wrongly fail the job.
-   - Failure (`4xx`, `5xx`, network error): Creates `DeliveryLog` with `success: false`, `statusCode: err.response?.status || null`, `responseBody: err.response ? JSON.stringify(err.response.data) : null`, `errorMessage: err.message`.
-   - The worker rethrows `err` to ensure BullMQ marks the attempt failed and schedules a retry.
+   - Success (`2xx`): Creates `DeliveryLog` with `success: true`, `statusCode: response.status`, `responseBody: JSON.stringify(response.data)` (truncated to `MAX_DELIVERY_RESPONSE_BODY_CHARS`), `durationMs`. Returns a small serializable summary (`{ statusCode, eventId, subscriberId, attemptNumber }`) — never the raw Axios response, whose circular references would break BullMQ completion bookkeeping and wrongly fail the job.
+   - Failure (`4xx`, `5xx`, network error): Creates `DeliveryLog` with `success: false`, `statusCode: err.response?.status || null`, `responseBody: err.response ? JSON.stringify(err.response.data) : null` (truncated), `errorMessage: err.message`, `durationMs`.
+   - Permanent `4xx` (all except `408`/`429`) → `UnrecoverableError` (DLQ immediately); retryable (`408`/`429`/`5xx`/no-response) → rethrows `err` so BullMQ schedules a retry. See `src/utils/retryPolicy.js`.
 
 ---
 
@@ -449,7 +478,7 @@ With `baseDelay = 1000ms` and `MAX_DELIVERY_ATTEMPTS = 5`:
 | **Attempt 5** | Retry 4 (Final) | $1000 \times 2^3 = 8000\text{ ms}$ (8s) | ~15s |
 
 ### Failure Behavior
-- **Thundering Herd Mitigation:** Exponential backoff spaces out subsequent delivery attempts to allow recovering downstream services time to stabilize.
+- **Thundering Herd Mitigation:** Exponential backoff spaces out subsequent delivery attempts to allow recovering downstream services time to stabilize. The worker adds up to `RETRY_JITTER_MS` (default `500ms`) random jitter on top of the base `1000 * 2^(attempt-1)` delay via a custom `backoffStrategy`.
 - **Retry Classification (current):** Only transient failures are retried (network errors, timeouts, `408`, `429`, `5xx`). Permanent client errors (other `4xx`) throw BullMQ's `UnrecoverableError` and escalate to the DLQ immediately without consuming all 5 attempts. See `src/utils/retryPolicy.js`.
 
 ---
@@ -481,10 +510,11 @@ In both cases BullMQ triggers the `deliveryWorker.on('failed')` event handler, w
 - *Security Note:* Protected by `authenticateAdmin` (`X-Admin-Api-Key`); unauthenticated callers receive `401`.
 
 ### DLQ Replay (`POST /dead-letters/:jobId/replay`)
-- Retrieves the failed job by ID from `deadLetterQueue`.
+- Retrieves the failed job by ID from `deadLetterQueue` (`404` if missing; `400` if the job lacks `eventId`/`subscriberId`/`subscriberUrl`/`payload`).
 - Replay Job ID: Constructs deterministic ID `replay-<deadLetterJobId>`.
 - In-Flight Replay Guard: Checks `deliveryQueue.getJob(replayJobId)`. If a job exists and its state is neither `'failed'` nor `'completed'`, returns `409 Conflict`.
-- Enqueues to main `deliveryQueue`: Adds job `'deliver'` with original data and `{ jobId: replayJobId }`.
+- Enqueues to main `deliveryQueue`: Adds job `'deliver'` with original data (`eventId`, `subscriberId`, `subscriberUrl`, `payload`, `requestId`) and `{ jobId: replayJobId }`.
+- Updates the parent `Event`: `$inc: { replayCount: 1 }`, `lastReplayedAt: now`, `lastReplayJobId: replayJobId` (visible via `GET /events/:id`).
 - Returns `202 Accepted` with `replayJobId`.
 - *Operational Caveats:*
   - Replaying does **not** delete the job from `deadLetterQueue`.
@@ -508,10 +538,11 @@ DeliveryLog records are append-only (`createdAt` only, no `updatedAt`).
 - `success`: Boolean (`true` for HTTP 2xx, `false` otherwise).
 - `errorMessage`: Error string (`err.message`) on failure, `null` on success.
 - `durationMs`: Elapsed time of the outbound HTTP attempt in milliseconds (success and failure).
+- `requestId`: Propagated `X-Request-Id` for tracing (null when absent).
 - `createdAt`: Automatic Mongoose timestamp.
 
 ### Auditability
-Subscribers can inspect their complete delivery log history via `GET /webhooks/logs`. Results are sorted in descending order (`createdAt: -1`) and populated with event details (`type`, `payload`, `createdAt`).
+Subscribers can inspect their complete delivery log history via `GET /webhooks/logs`. Results are sorted in descending order (`createdAt: -1`) and populated with event details (`type`, `payload`, `createdAt`, `requestId`).
 
 ---
 
@@ -542,15 +573,17 @@ When Redis is down during event ingestion, the API records the event in MongoDB 
 ## 17. Idempotency and Deduplication
 
 ### Deduplication Points in Implementation
-1. **Initial Queueing:** BullMQ job IDs are deterministic:
+1. **Ingestion idempotency (producer-scoped):** `POST /events` accepts `Idempotency-Key` header or `idempotencyKey` body field. Uniqueness is enforced by the sparse-unique `{ producerId: 1, idempotencyKey: 1 }` index. Same key + same `type`/`payload` → `200` idempotent replay (`isDuplicate: true`, no new `Event` or jobs); same key + different `type`/`payload` → `409`. A `11000` race on concurrent creates is caught and resolved to `200`.
+2. **Initial Queueing:** BullMQ job IDs are deterministic:
    `event-<eventId>-subscriber-<subscriberId>`
    If `queueEventDeliveries` is executed multiple times for the same event (e.g., during recovery retries), BullMQ will ignore duplicate job additions as long as the existing job is still stored in Redis.
-2. **Replay Deduplication:** Replay job IDs are deterministic:
+3. **Replay Deduplication:** Replay job IDs are deterministic:
    `replay-<deadLetterJobId>`
    Replaying an active or waiting job returns `409 Conflict`.
 
 ### Deduplication Limitations & Edge Cases
-- **No Ingestion Idempotency:** `POST /events` does not accept an `Idempotency-Key` header and does not enforce a unique constraint on producer payloads. If a producer sends duplicate events, the system creates distinct `Event` documents, generating duplicate delivery jobs.
+- **Key scope:** idempotency keys are scoped per-producer (`{ producerId, idempotencyKey }`). Two different producers can reuse the same key without colliding. Requests without a key (or with an empty/blank key) are never deduplicated.
+- **Payload comparison:** the duplicate check uses `JSON.stringify(payload)` equality, so semantically equal payloads with different key order are treated as different.
 - **Job Eviction Window:** The delivery queue sets `removeOnComplete: 100`. Once 100 subsequent jobs complete, older completed jobs are purged from Redis. After eviction, re-adding a job with the same ID will treat it as a new job, bypassing Redis deduplication.
 - **Subscriber Processing Semantics:** If a subscriber receives a webhook, processes the side effect, but times out or crashes before sending an HTTP response, the worker retries the job. Subscribers must implement idempotency using `X-Webhook-Event-Id`.
 
@@ -567,7 +600,7 @@ When Redis is down during event ingestion, the API records the event in MongoDB 
 - **Management Routes (`/webhooks`, `/dead-letters`, `/producers`):**
   - Window: 15 minutes (`15 * 60 * 1000 ms`).
   - Max requests: 50 per IP.
-- *Limitation:* Counters are stored in process memory. Across $N$ load-balanced instances, the effective limit is $N \times \text{limit}$.
+- *Note:* In `NODE_ENV === 'test'` the limiter falls back to the in-memory store to avoid open Redis handles in Jest. In all other envs counters live in Redis, so limits hold across API replicas.
 
 ### Payload & Parameter Validation
 - Express body parser enforces a strict `16kb` limit (`express.json({ limit: '16kb' })`).
@@ -608,7 +641,7 @@ Register a new producer client.
     "allowedEvents": ["payment.success", "payment.failed", "order.created"]
   }
   ```
-- **Validation:** `producerUrl` must be valid URL (HTTPS in production); `allowedEvents` non-empty array of `noun.verb` strings with no duplicates.
+- **Validation:** `producerUrl` passes DNS-based SSRF validation (`src/utils/ssrf.js`; HTTPS enforced in production); `allowedEvents` non-empty array of `noun.verb` strings with no duplicates.
 - **Response `201 Created`:**
   ```json
   {
@@ -702,6 +735,11 @@ Deactivate the authenticated subscriber.
   }
   ```
 
+#### `GET /webhooks` / `PATCH /webhooks` / `PATCH /webhooks/events`
+- `GET /webhooks` (auth `x-api-key`): returns the caller profile (`subscriberId`, `subscriberUrl`, `events`, `isActive`, `createdAt`, `updatedAt`).
+- `PATCH /webhooks` (auth `x-api-key`): body `{ subscriberUrl?, events? }` (at least one required; `subscriberId`/`apiSecret`/`signingKey` rejected with `400`). Re-validates URL via SSRF check; duplicate URL → `409`. Returns `{ message: "Subscriber updated successfully", subscriberId, subscriberUrl, events }`.
+- `PATCH /webhooks/events`, `DELETE /webhooks`, and `GET /webhooks/logs` behave as described in §9 (all `x-api-key` authenticated; all errors `{ "error": ... }`).
+
 #### `GET /webhooks/logs`
 View delivery attempt history for the authenticated subscriber.
 - **Auth:** `x-api-key: <subscriberApiKey>`
@@ -743,6 +781,7 @@ View delivery attempt history for the authenticated subscriber.
 #### `POST /events`
 Ingest an event and enqueue deliveries.
 - **Auth:** `x-api-key: <producerApiKey>`
+- **Idempotency:** optional `Idempotency-Key` header or `idempotencyKey` body field (producer-scoped; same key+same `type`/`payload` → `200 isDuplicate:true`; same key+different → `409`). See §8/§17.
 - **Request Body:**
   ```json
   {
@@ -790,7 +829,7 @@ Ingest an event and enqueue deliveries.
 
 #### `GET /dead-letters`
 List permanently failed delivery jobs waiting in DLQ.
-- **Auth:** Public / None.
+- **Auth:** `X-Admin-Api-Key: <adminKey>` via `authenticateAdmin` (`401` if missing/invalid; `503` if `ADMIN_API_KEY` is not configured).
 - **Query Parameters:** `limit` (default 50, max 100).
 - **Response `200 OK`:**
   ```json
@@ -815,7 +854,7 @@ List permanently failed delivery jobs waiting in DLQ.
 
 #### `POST /dead-letters/:jobId/replay`
 Re-enqueue a DLQ job into the delivery queue.
-- **Auth:** Public / None.
+- **Auth:** `X-Admin-Api-Key: <adminKey>` via `authenticateAdmin` (the router mounts `router.use(authenticateAdmin)`, so both DLQ routes are admin-only).
 - **Path Parameter:** `jobId` (the DLQ job identifier).
 - **Responses:**
   - `202 Accepted`:
@@ -845,6 +884,19 @@ Liveness check.
   ```
 - *Limitation:* Shallow check; does not verify MongoDB connection state or Redis reachability.
 
+#### `GET /ready`
+Readiness check (MongoDB + Redis).
+- **Auth:** None.
+- **Behavior:** `mongoose.connection.readyState === 1` plus `redisConnection.ping()` raced against a `2000ms` timeout (the BullMQ connection retries indefinitely by design, so readiness must answer fast either way).
+- **Response `200 OK` (ready) / `503` (unready):**
+  ```json
+  {
+    "status": "ready",
+    "dependencies": { "mongodb": "connected", "redis": "connected" },
+    "timestamp": "2026-03-20T10:20:00.000Z"
+  }
+  ```
+
 ---
 
 ## 21. Delivery Request Format
@@ -859,6 +911,7 @@ X-Webhook-Signature: a3f87b8d80f08960fa291b8d2345e8d895b6c039d91f24d1e2a3b4c5d6e
 X-Webhook-Event-Id: 65f1a2b3c4d5e6f7a8b9c050
 X-Webhook-Attempt: 1
 X-timestamp: 1710928800000
+X-Request-Id: 9f7c2e1a-4b5c-4d6e-8f0a-123456789abc
 Content-Length: 53
 
 {"orderId":"ORD-9999","amount":2500,"currency":"USD"}
@@ -982,8 +1035,7 @@ workers are tested with mocked dependencies).
 Earlier versions of this file recorded test/implementation mismatches that have
 since been fixed: outdated HMAC timestamp arguments, model mock casing,
 missing `isActive` in mocks, IORedis open handles in Jest, and stale mock
-scripts. If a section below still describes one of these as current, the
-passing suite above takes precedence.
+scripts. All sections above now reflect the fixed implementation.
 
 ---
 
@@ -1088,25 +1140,22 @@ docker-compose up --build
 
 ## 28. Known Limitations and Production Gaps
 
-> **Note:** items 1–4, 6, 7 and 10–12 below were addressed in later implementation
-> rounds (encrypted secrets at rest, DNS-based SSRF checks, ingestion idempotency,
-> MongoDB indexes, Redis-backed rate limiting, DLQ admin auth, global
-> `WEBHOOK_TIMEOUT_MS`, `GET /ready` readiness check, fixed tests and mocks,
-> failure classification (permanent `4xx` and deterministic pre-delivery
-> failures fail fast via `UnrecoverableError`; transient DB/network errors retry).
-> Items 5 and 9 remain open.
+> **Status (verified against code, 16 suites / 122 tests passing):** items 1–4,
+> 6–8 and 10–12 are **fixed** (encrypted secrets at rest, DNS-based SSRF checks,
+> producer-scoped ingestion idempotency, MongoDB indexes, Redis-backed rate
+> limiting, DLQ admin auth, failure classification via `UnrecoverableError`,
+> global `WEBHOOK_TIMEOUT_MS`, `GET /ready`, fixed tests/mocks). Only items
+> 5 and 9 remain open.
 
-1. **Plaintext Secret Storage:** `Subscriber.signingKey` is stored in plaintext in MongoDB. An attacker with read access to the database can forge deliveries to all subscribers.
-2. **Lack of SSRF Mitigation:** `subscriberUrl` and `producerUrl` validation only checks URL format and HTTPS protocol in production. Private IP ranges (e.g., `127.0.0.1`, `10.0.0.0/8`, AWS metadata endpoint `169.254.169.254`) are not resolved or blocked.
-3. **No Ingestion Idempotency (`POST /events`):** No `Idempotency-Key` header or deduplication index exists. Producer retries result in duplicate events and multiple deliveries to subscribers.
-4. **Missing Database Indexes:**
-   - `Event.queueStatus` is unindexed; the recovery loop performs a full collection scan every 5 seconds.
-   - `DeliveryLog` lacks a compound index on `{ subscriberId: 1, createdAt: -1 }`, requiring in-memory sorting when querying subscriber logs.
-5. **No Distributed Locking on Event Recovery:** The recovery loop uses an in-process boolean flag (`isRunning`). Running multiple API replicas without `DISABLE_RECOVERY=true` causes overlapping recovery queries and duplicate queue additions.
-6. **In-Memory Rate Limiting:** `express-rate-limit` maintains counters in process memory instead of Redis. The effective rate limit scales linearly with the number of API instances.
-7. **Unauthenticated DLQ Endpoints:** `GET /dead-letters` and `POST /dead-letters/:jobId/replay` lack authentication middleware, allowing unauthorized inspection and replay of failed jobs.
-8. **Blind Retrying on 4xx Client Errors:** (Fixed — kept as historical note.) The worker now distinguishes permanent `4xx` failures (fail fast via `UnrecoverableError`) from transient `408`/`429`/`5xx`/network errors (retried). See `src/utils/retryPolicy.js` and §13.
-9. **Incomplete DLQ Replay State:** Replaying a job from the DLQ does not remove it from the DLQ queue, nor does it update `Event.queueStatus` in MongoDB.
-10. **Hardcoded Delivery Timeout:** Outgoing Axios requests have a fixed 5000ms timeout with no per-subscriber timeout configurability.
-11. **Shallow Health Check:** `GET /health` returns `{ status: "ok" }` unconditionally without checking MongoDB or Redis connectivity.
-12. **Outdated Tests and Mock Scripts:** Test files and mock scripts in the repository have syntax and interface mismatches with current function signatures (such as timestamp handling in HMAC verification and API key headers in mock scripts).
+1. **(Fixed) Secret storage:** `Subscriber.signingKey` is AES-256-GCM encrypted at rest (`iv:authTag:ciphertext`); the worker decrypts per delivery with `WEBHOOK_ENCRYPTION_KEY`. Plaintext is never stored.
+2. **(Fixed) SSRF mitigation:** `validateNoSSRF` (`src/utils/ssrf.js`) resolves DNS (A+AAAA) and blocks loopback, RFC 1918 private, link-local/`169.254.x.x` (incl. cloud metadata), `0.0.0.0/8`, documentation ranges, and IPv6 equivalents; enforces `https:` in production; worker uses `maxRedirects: 0` + pre-delivery re-check. `DISABLE_SSRF_CHECK=true` is dev/test-only.
+3. **(Fixed) Ingestion idempotency:** `POST /events` accepts `Idempotency-Key` header or `idempotencyKey` body field, scoped `{ producerId, idempotencyKey }` via sparse-unique index; same key+same payload → `200 isDuplicate:true`, same key+different payload → `409`, `11000` race → `200`.
+4. **(Fixed) Database indexes:** `Event { queueStatus: 1, createdAt: 1 }` (recovery scan), `Event { producerId: 1, idempotencyKey: 1 }` sparse-unique, `DeliveryLog { subscriberId: 1, createdAt: -1 }` (logs query), `Subscriber { events: 1 }` multikey, plus unique `producerUrl`/`subscriberUrl`/`apiSecret`.
+5. **(Open) No Distributed Locking on Event Recovery:** The recovery loop uses a process-local `isRunning` flag. Running multiple API replicas without `DISABLE_RECOVERY=true` (set on all but one instance) causes overlapping scans and duplicate `addBulk` attempts (BullMQ deterministic IDs mitigate but do not eliminate the race after job eviction). Production fix: Redis Redlock or MongoDB leader election.
+6. **(Fixed) Rate limiting:** Redis-backed (`express-rate-limit` + `rate-limit-redis`) on a dedicated bounded connection (`RATE_LIMIT_REDIS_TIMEOUT_MS`, fail-closed `503`); limits hold across replicas. In-memory store is test-only (`NODE_ENV === 'test'`).
+7. **(Fixed) DLQ auth:** Both DLQ routes sit behind `router.use(authenticateAdmin)` requiring `X-Admin-Api-Key` (constant-time SHA-256 compare; `401` missing/invalid, `503` when `ADMIN_API_KEY` unconfigured).
+8. **(Fixed) 4xx handling:** `src/utils/retryPolicy.js` retries only transient failures (no-response, `408`, `429`, `5xx`); other `4xx` plus deterministic pre-delivery failures (missing/inactive subscriber, undecryptable secret) throw `UnrecoverableError` and escalate to DLQ immediately.
+9. **(Open, partial) Incomplete DLQ Replay State:** Replay now `$inc`s `Event.replayCount` and stamps `lastReplayedAt`/`lastReplayJobId`, and guards in-flight replays with deterministic `replay-<dlqId>` + `409`. It still does **not** delete the job from `webhook-dead-letter` nor update `Event.queueStatus`/`deliveryTargets`; re-calling replay after completion/failure enqueues again.
+10. **(Fixed — by design) Delivery timeout:** Single global `WEBHOOK_TIMEOUT_MS` (default `5000ms`) for all outbound deliveries; per-subscriber timeout was deliberately removed (see scope note §1). Documented in §11/§21/§26.
+11. **(Fixed) Health checks:** `GET /health` remains a shallow liveness probe by design; `GET /ready` checks MongoDB (`readyState === 1`) + Redis `ping()` (2s timeout) and returns `200 ready` / `503 unready` with per-dependency status.
+12. **(Fixed) Tests and mocks:** 16 suites / 122 tests pass (`npm test` → `jest --runInBand src/tests`); mocks use current auth (`x-api-key`), 4-arg `verifySignature`, and `DISABLE_SSRF_CHECK=true` for localhost demo.
