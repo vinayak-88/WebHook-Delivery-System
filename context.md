@@ -24,7 +24,7 @@
 The **Webhook Delivery System** is a production-style, asynchronous event fan-out and webhook delivery engine built in Node.js. It accepts event notifications from authenticated producers, matches them against active subscribers subscribed to specific event types, persists the events, and asynchronously delivers payloads to subscriber HTTP endpoints.
 
 ### Core Guarantees & Operational Model
-- **Delivery Semantic: At-Least-Once Delivery.** The system guarantees that every active subscriber registered for an event type will receive at least one delivery attempt, with automatic retries on failure. It does **not** guarantee exactly-once delivery; duplicate deliveries can occur if subscriber endpoints process a payload but experience a network timeout before returning a response, if retries are triggered, or if duplicate events are ingested.
+- **Delivery Semantic: At-Least-Once Delivery (best-effort, not guaranteed).** The system targets at least one delivery attempt per active subscriber registered for an event type, with automatic retries on transient failure. It does **not** guarantee exactly-once delivery (and cannot guarantee delivery at all under prolonged Mongo/Redis/subscriber outages); duplicate deliveries can occur if subscriber endpoints process a payload but experience a network timeout before returning a response, if retries are triggered, or if duplicate events are ingested.
 - **Asynchronous Decoupling:** Event ingestion is completely decoupled from HTTP delivery. The API acknowledges event ingestion immediately (`202 Accepted`), offloading delivery execution to background workers via a Redis-backed queue.
 - **Payload Integrity & Authenticity:** Deliveries are signed using HMAC-SHA256 with a timestamp to prevent tampering and replay attacks.
 - **Resilience & Auditability:** Transient failures undergo exponential backoff retries. Exhausted jobs escalate to a Dead Letter Queue (DLQ) for inspection and manual replay. Every delivery attempt is recorded in an audit log collection.
@@ -136,9 +136,9 @@ The system is partitioned into two independent runtime processes: the **API Serv
    - On HTTP 4xx/5xx or network timeout/error: Persists a `DeliveryLog` record (`success: false`, `statusCode` or `null`, `errorMessage`, `durationMs`), logs a warning, and either throws `UnrecoverableError` (permanent `4xx`) or rethrows for BullMQ retry.
 
 ### Step 5: Retry & Dead Letter Queue (DLQ)
-1. BullMQ catches the rethrown error and checks `job.attemptsMade`.
+1. BullMQ catches the rethrown error and checks `job.attemptsMade`. Permanent failures (`UnrecoverableError`: non-retryable `4xx`, missing/inactive subscriber, deterministic signing failures) skip retries and go straight to step 3.
 2. If `job.attemptsMade < 5`, BullMQ reschedules the job using exponential backoff (`delay = 1000 * 2^(attempt - 1)`).
-3. If `job.attemptsMade >= 5` (all 5 attempts exhausted), the worker's `deliveryWorker.on('failed')` listener intercepts the final failure:
+3. If `job.attemptsMade >= 5` (all 5 attempts exhausted) **or** the failure is permanent, the worker's `deliveryWorker.on('failed')` listener intercepts the final failure:
    - Adds the job to `deadLetterQueue` (`webhook-dead-letter`) with job name `'failed-delivery'` and deterministic job ID `'dead-letter-' + job.id`.
    - Dead letter job data includes original payload, failure reason, and `failedAt` ISO timestamp.
 
@@ -228,7 +228,7 @@ webhook-delivery-system/
 ## 6. Core Components
 
 ### 1. Express API (`src/app.js`)
-Serves HTTP endpoints, enforces JSON parsing limits (`BODY_LIMIT`, default `16kb`), captures `req.rawBody`, runs Redis-backed rate limiters on a dedicated bounded connection, mounts route controllers, and registers graceful shutdown handlers (`SIGTERM`, `SIGINT`).
+Serves HTTP endpoints, enforces JSON parsing limits (`BODY_LIMIT`, default `16kb`, `413 { error: "Payload too large", limit }` on overflow), captures `req.rawBody`, runs Redis-backed rate limiters on a dedicated bounded connection (`src/config/rateLimitRedis.js`: `enableOfflineQueue: false`, `maxRetriesPerRequest: 1`, per-command bound `RATE_LIMIT_REDIS_TIMEOUT_MS`, Lua re-`init()` on reconnect via `registerRateLimitStore`, fail-closed `503`; never confused with the BullMQ connection which intentionally uses `maxRetriesPerRequest: null`), mounts route controllers, and registers graceful shutdown handlers (`SIGTERM`, `SIGINT`) that close the BullMQ queue plus **both** Redis connections (`redisConnection` and `rateLimitRedisConnection`) and Mongoose.
 
 ### 2. Delivery Worker (`src/workers/deliveryWorker.js`)
 Independent daemon process running a BullMQ `Worker` instance for the `webhook-delivery` queue. Executes HTTP requests, records delivery attempts to MongoDB, handles transient errors, and pushes permanently failing jobs to the DLQ.
@@ -376,15 +376,18 @@ Immutable audit log for each individual delivery attempt.
 ## 10. Queue and Worker Architecture
 
 ### BullMQ Queue Configuration (`src/queues/deliveryQueue.js`)
+- **Shared BullMQ Redis connection (`src/config/redis.js`):** `maxRetriesPerRequest: null` (required by BullMQ) with unbounded offline queue — intentionally the opposite of the rate-limit connection. Holds `webhook-delivery` jobs/state, retry scheduling (delayed jobs), completed/failed retention, and the `webhook-dead-letter` store. Nothing else in the app shares this client except the worker, queue helpers, DLQ replay, and the `GET /ready` ping.
 - **Main Queue:** `webhook-delivery`
   - `attempts: 5` (`MAX_DELIVERY_ATTEMPTS`)
   - `backoff.type: 'exponential'`
-  - `backoff.delay: 1000` (base delay 1000ms)
+  - `backoff.delay: 1000` (base delay 1000ms; worker adds `RETRY_JITTER_MS` jitter via custom `backoffStrategy`)
   - `removeOnComplete: 100` (retains last 100 completed jobs in Redis)
   - `removeOnFail: 200` (retains last 200 failed jobs in Redis)
+  - Deterministic job IDs: `event-<eventId>-subscriber-<subscriberId>` (`:` is forbidden in BullMQ custom IDs); DLQ jobs: `dead-letter-<jobId>`; replay jobs: `replay-<deadLetterJobId>`.
 - **Dead Letter Queue:** `webhook-dead-letter`
   - `removeOnComplete: 500`
   - `removeOnFail: 200`
+- **What is NOT in Redis:** no generic cache, no sessions, no MongoDB mirror. Domain entities and audit logs live only in MongoDB; Redis holds queue/rate-limit state only.
 
 ### Worker Concurrency & Threading Model
 - **Worker Process:** Runs via `node src/workers/deliveryWorker.js`.
@@ -396,7 +399,7 @@ Immutable audit log for each individual delivery attempt.
 
 ## 11. Delivery Process
 
-1. **Job Data Ingestion:** The worker extracts `{ eventId, subscriberId, subscriberUrl, payload }` from `job.data` after `assertValidDeliveryJobData` schema validation (ObjectId format, URL shape, payload present). Note: Webhook signing secrets are **never** stored in job data.
+1. **Job Data Ingestion:** The worker extracts `{ eventId, subscriberId, subscriberUrl, payload, requestId? }` from `job.data` after `assertValidDeliveryJobData` schema validation (ObjectId format, URL shape, payload present). Note: Webhook signing secrets are **never** stored in job data — the worker fetches and decrypts them fresh from MongoDB at delivery time.
 2. **Fresh Subscriber Lookup:** The worker runs `validateNoSSRF(subscriberUrl)` immediately before dialing, then queries MongoDB: `Subscriber.findById(subscriberId).select("signingKey isActive")`. Transient DB errors propagate so BullMQ retries; only the resolved outcome below is classified permanent.
    - If the subscriber record is missing or `isActive === false`, the worker persists a pre-delivery `DeliveryLog` (`statusCode/responseBody/durationMs: null`) and throws `UnrecoverableError: Subscriber <subscriberId> is inactive or not found` (fail-fast to DLQ, no retry burn).
 3. **Payload Serialization:**
@@ -459,6 +462,17 @@ This preserves the raw wire buffer `req.rawBody` for verification, avoiding prop
 - **Current Protection:** URL syntax validation via `new URL()` plus DNS-based checks in `src/utils/ssrf.js`: hostnames are resolved and every IP is matched against blocked ranges (loopback, RFC 1918 private, link-local/`169.254.x.x` metadata, IPv6 equivalents). Enforces `https:` when `NODE_ENV === 'production'`; Axios uses `maxRedirects: 0`.
 - **Bypass (dev/test only):** `DISABLE_SSRF_CHECK=true` skips the check for the localhost mock subscriber. Never enable in production.
 
+### CURRENT Authentication, Request Handling & Error Hygiene (verified)
+- **Producer/subscriber auth:** `x-api-key` → SHA-256 → `findOne({ apiSecret, isActive: true })`; missing key → `401`, wrong/inactive key → `401`. Inactive credentials are rejected on every call.
+- **Admin auth (DLQ):** `X-Admin-Api-Key` → SHA-256 + `crypto.timingSafeEqual` compare against `ADMIN_API_KEY` (read per request); missing/invalid → `401`, unconfigured server → `503`.
+- **HMAC verify + admin compare** both use `timingSafeEqual` inside `try/catch` (length-mismatch safe).
+- **Encryption key:** `WEBHOOK_ENCRYPTION_KEY` must be 64-char hex; startup-fatal in production. Distinct from mock/demo `WEBHOOK_SECRET` (plaintext HMAC secret shared only by `src/mock/*`; never used by the server for encryption).
+- **Body limits:** `BODY_LIMIT` (default `16kb`); overflow → `413 { error: "Payload too large", limit }`.
+- **Rate limiting:** Redis-backed, fail-closed `503` (see §18); never in-memory except `NODE_ENV === 'test'`.
+- **Production errors:** non-413 500s return generic `Internal server error` without stacks; all errors are `{ "error": ... }`.
+- **Request IDs:** `X-Request-Id` accepted if safe alphanumerics ≤128 chars else generated UUID; echoed on responses; persisted to `Event`/`DeliveryLog`/jobs/headers.
+- **DLQ auth:** both DLQ routes behind `authenticateAdmin`; no unauthenticated DLQ access exists in current code.
+
 ---
 
 ## 13. Retry and Exponential Backoff
@@ -487,8 +501,8 @@ With `baseDelay = 1000ms` and `MAX_DELIVERY_ATTEMPTS = 5`:
 
 ### Escalation Mechanism
 A job escalates to the DLQ in either of two cases:
-1. Permanent failure: the worker throws BullMQ's `UnrecoverableError` (non-retryable `4xx`), escalated on the first failure.
-2. Exhausted retries: `job.attemptsMade >= MAX_DELIVERY_ATTEMPTS` (5) for transient failures.
+1. Permanent failure: the worker throws BullMQ's `UnrecoverableError` — non-retryable `4xx` (all except `408`/`429`), missing/inactive subscriber pre-delivery failures, and deterministic signing-preparation failures (undecryptable secret, unserializable payload, HMAC errors) — escalated on the first failure without consuming all 5 attempts.
+2. Exhausted retries: `job.attemptsMade >= MAX_DELIVERY_ATTEMPTS` (5) for transient failures (network errors, timeouts, `408`, `429`, `5xx`, transient DB lookup failures).
 
 In both cases BullMQ triggers the `deliveryWorker.on('failed')` event handler, which enqueues the job into `deadLetterQueue` (`webhook-dead-letter`):
    - Job Name: `'failed-delivery'`
@@ -556,8 +570,8 @@ When Redis is down during event ingestion, the API records the event in MongoDB 
   - `RECOVERY_INTERVAL_MS`: Defaults to `5000ms`.
   - `RECOVERY_BATCH_SIZE`: Defaults to `25` events.
 - **Execution Flow:**
-  1. Queries pending events: `Event.find({ queueStatus: 'pending' }).sort({ createdAt: 1 }).limit(batchSize)`.
-  2. For each pending event, invokes `queueEventDeliveries(event)`.
+  1. Queries pending events: `Event.find({ queueStatus: 'pending' }).sort({ createdAt: 1 }).limit(batchSize)` (covered by the `{ queueStatus: 1, createdAt: 1 }` index).
+  2. For each pending event, invokes `queueEventDeliveries(event)` which reuses deterministic job IDs (`event-<eventId>-subscriber-<subscriberId>`), so BullMQ dedupes re-adds while the original job is still retained in Redis.
   3. On successful `addBulk`, updates `Event.queueStatus = 'queued'` and records `queueEnqueuedAt`.
   4. If queueing fails, logs a warning and leaves `queueStatus: 'pending'` for the next tick.
 - **Outage ingress behavior:** rate limiting uses a dedicated connection bounded by `RATE_LIMIT_REDIS_TIMEOUT_MS` (default `1000ms`). If Redis is down when a request arrives, the limiter fails closed with a generic `503` instead of hanging, so the request never reaches event persistence. The `202` + `pending` recovery path therefore covers queue failures after the limiter (e.g. `addBulk` failing while the limiter call succeeded), not a full Redis outage at ingress.
@@ -861,8 +875,8 @@ Re-enqueue a DLQ job into the delivery queue.
     ```json
     {
       "message": "Dead-letter job replayed",
-      "deadLetterJobId": "dead-letter-event:...",
-      "replayJobId": "replay-dead-letter-event:..."
+      "deadLetterJobId": "dead-letter-event-...",
+      "replayJobId": "replay-dead-letter-event-..."
     }
     ```
   - `404 Not Found`: Dead letter job does not exist in DLQ.
@@ -993,8 +1007,9 @@ app.post('/receive', (req, res) => {
 - **During Worker Delivery:** The worker cannot fetch `Subscriber` details. The job attempt throws and will be retried by BullMQ. If Mongo is down when writing `DeliveryLog`, the worker catches and logs the failure (`rethrowOnFailure: false`), allowing HTTP delivery to proceed if already sent.
 - **During Recovery Loop:** The recovery query throws and logs an error; the timer continues to attempt scans on subsequent intervals.
 
-### 2. Redis Outage
-- **During Event Ingestion:** `Event.create` persists the event to MongoDB with `queueStatus: 'pending'`. The `deliveryQueue.addBulk` call fails. The catch block marks `Event.lastQueueError` with the failure details and returns `202 Accepted` with `recoveryScheduled: true`. Once Redis recovers, the background recovery loop automatically queues the pending events.
+### 2. Redis Outage (two distinct failure points — do not conflate)
+- **A. Redis down at rate-limiter ingress (fails closed, no pending event):** the dedicated rate-limit connection (`enableOfflineQueue: false`, `maxRetriesPerRequest: 1`) fails within `RATE_LIMIT_REDIS_TIMEOUT_MS` (default `1000ms`); `passOnStoreError: false` makes the request fail closed with `503 { "error": "Service temporarily unavailable" }`. The request never reaches `Event.create`, so **no** `pending` event exists for recovery. This is intentional (never let traffic through un-limited).
+- **B. Redis down at queue handoff (pending + recovery):** the request passed the limiter, `Event.create` persisted the event to MongoDB with `queueStatus: 'pending'`, then `deliveryQueue.addBulk` failed. The catch block marks `Event.lastQueueError` with the failure details and returns `202 Accepted` with `recoveryScheduled: true`. Once Redis recovers, the background recovery loop automatically queues the pending events.
 - **During Worker Execution:** IORedis emits reconnection errors. BullMQ halts job polling until the Redis connection is re-established. Active jobs may stall and be reclaimed upon reconnection.
 
 ### 3. Downstream Subscriber Errors (4xx vs 5xx)
@@ -1031,7 +1046,7 @@ workers are tested with mocked dependencies).
 - **Queueing/recovery:** `eventQueue.test.js` (deterministic job IDs, bulk queueing, `no_subscribers`), `recovery.test.js` (pending stays pending on Redis failure, queues when back), `jobSchema.test.js` (job data validation).
 - **Routes/security/ops:** `idempotency.test.js` (create → duplicate → 409, header + body keys), `deadLetters.test.js` (admin auth, single replay 202/409/404), `ssrf.test.js` (blocked ranges, bypass flag), `routes.test.js` (health/readiness, request IDs, body limit), `rateLimitRedis.test.js` (dedicated connection, timeout bound, fail-closed 503, BullMQ isolation).
 
-### Historical test notes (resolved; kept for context)
+### HISTORICAL test notes (previous state — not current behavior)
 Earlier versions of this file recorded test/implementation mismatches that have
 since been fixed: outdated HMAC timestamp arguments, model mock casing,
 missing `isActive` in mocks, IORedis open handles in Jest, and stale mock
@@ -1106,6 +1121,7 @@ scripts. All sections above now reflect the fixed implementation.
 | `DISABLE_RECOVERY` | If `'true'`, disables the background pending recovery loop | `false` |
 | `DISABLE_SSRF_CHECK` | If `'true'`, allows deliveries to localhost/private IPs (dev/test only) | `false` |
 | `WEBHOOK_SECRET` / `BASE_URL` / `SUBSCRIBER_URL` / `DELIVERY_WAIT_MS` | Mock producer/subscriber demo config only | dev defaults (see `.env.example`) |
+| | **Note:** `WEBHOOK_SECRET` is mock/demo-only (plaintext HMAC secret shared by `src/mock/*`). It is **not** the server-side `WEBHOOK_ENCRYPTION_KEY` and is never used by the server for encryption. | — |
 
 ---
 
@@ -1146,6 +1162,12 @@ docker-compose up --build
 > limiting, DLQ admin auth, failure classification via `UnrecoverableError`,
 > global `WEBHOOK_TIMEOUT_MS`, `GET /ready`, fixed tests/mocks). Only items
 > 5 and 9 remain open.
+
+> **Label key — CURRENT vs HISTORICAL:** entries marked **(Fixed)** describe the
+> CURRENT implementation (the historical broken state — e.g. "rate limiting was
+> in-memory", "job IDs used colons", "secrets were plaintext", "DLQ lacked auth",
+> "no idempotency existed" — is **not** current and is mentioned only to record
+> what was fixed). Entries marked **(Open)** describe CURRENT limitations.
 
 1. **(Fixed) Secret storage:** `Subscriber.signingKey` is AES-256-GCM encrypted at rest (`iv:authTag:ciphertext`); the worker decrypts per delivery with `WEBHOOK_ENCRYPTION_KEY`. Plaintext is never stored.
 2. **(Fixed) SSRF mitigation:** `validateNoSSRF` (`src/utils/ssrf.js`) resolves DNS (A+AAAA) and blocks loopback, RFC 1918 private, link-local/`169.254.x.x` (incl. cloud metadata), `0.0.0.0/8`, documentation ranges, and IPv6 equivalents; enforces `https:` in production; worker uses `maxRedirects: 0` + pre-delivery re-check. `DISABLE_SSRF_CHECK=true` is dev/test-only.
