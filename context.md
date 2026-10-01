@@ -1,6 +1,6 @@
 # Project Context: Webhook Delivery System
 
-> **Scope simplification note:** six advanced features were deliberately removed to keep
+> **HISTORICAL scope simplification note (removed features — not current behavior):** six advanced features were deliberately removed to keep
 > the project interview-ready for a 1–2 year backend developer: the EventType registry,
 > DLQ monitoring/alerting, per-subscriber timeout config (replaced by a single global
 > `WEBHOOK_TIMEOUT_MS`), the secret rotation endpoint, plaintext-secret migration
@@ -459,7 +459,7 @@ express.json({
 This preserves the raw wire buffer `req.rawBody` for verification, avoiding property re-ordering issues common in JSON re-serialization.
 
 ### SSRF Protection Status
-- **Current Protection:** URL syntax validation via `new URL()` plus DNS-based checks in `src/utils/ssrf.js`: hostnames are resolved and every IP is matched against blocked ranges (loopback, RFC 1918 private, link-local/`169.254.x.x` metadata, IPv6 equivalents). Enforces `https:` when `NODE_ENV === 'production'`; Axios uses `maxRedirects: 0`.
+- **Current Protection:** URL syntax validation via `new URL()` plus DNS-based checks in `src/utils/ssrf.js`: hostnames are resolved (A+AAAA) and every IP is matched against blocked ranges (loopback, RFC 1918 private, link-local/`169.254.x.x` metadata, `0.0.0.0/8`, documentation ranges, IPv6 equivalents). Enforces `https:` when `NODE_ENV === 'production'`; Axios uses `maxRedirects: 0`.
 - **Bypass (dev/test only):** `DISABLE_SSRF_CHECK=true` skips the check for the localhost mock subscriber. Never enable in production.
 
 ### CURRENT Authentication, Request Handling & Error Hygiene (verified)
@@ -610,7 +610,7 @@ When Redis is down during event ingestion, the API records the event in MongoDB 
   - Window: 1 minute (`60 * 1000 ms`).
   - Max requests: 100 per IP.
   - Response on limit: `429 { "error": "Too many requests, slow down" }`.
-- **Dedicated connection:** rate limiting uses `src/config/rateLimitRedis.js`, separate from the BullMQ connection. Request-time commands are bounded by `RATE_LIMIT_REDIS_TIMEOUT_MS` (default `1000ms`): if Redis is unavailable, the limiter fails closed with a generic `503 { "error": "Service temporarily unavailable" }` instead of hanging the request. The client keeps reconnecting in the background, so normal limiting resumes on its own once Redis returns. BullMQ's connection (`maxRetriesPerRequest: null`) is untouched.
+- **Dedicated connection:** rate limiting uses `src/config/rateLimitRedis.js`, separate from the BullMQ connection. Client options are `enableOfflineQueue: false` (commands while disconnected reject immediately instead of queueing behind a reconnect loop) and `maxRetriesPerRequest: 1` (a flaky Redis cannot pile retries onto request latency). Request-time commands run through `sendRateLimitCommand`, which waits for a usable connection via `whenUsable()` raced against `RATE_LIMIT_REDIS_TIMEOUT_MS` (default `1000ms`): if Redis is unavailable, the limiter fails closed with a generic `503 { "error": "Service temporarily unavailable" }` (`passOnStoreError: false`) instead of hanging the request. The client keeps its default reconnect strategy in the background, so normal limiting resumes on its own once Redis returns. Lua/script state is reloaded via `registerRateLimitStore` + a `ready`-listener that re-runs `store.init({ windowMs })` on every (re)connect (covers booting while Redis is down). The connection is closed during graceful shutdown (`rateLimitRedisConnection.quit()` alongside `redisConnection.quit()`). BullMQ's connection intentionally retains the opposite settings (`maxRetriesPerRequest: null`, unbounded offline queue) because BullMQ requires them.
 - **Management Routes (`/webhooks`, `/dead-letters`, `/producers`):**
   - Window: 15 minutes (`15 * 60 * 1000 ms`).
   - Max requests: 50 per IP.
@@ -879,6 +879,8 @@ Re-enqueue a DLQ job into the delivery queue.
       "replayJobId": "replay-dead-letter-event-..."
     }
     ```
+  - `400 Bad Request`: DLQ job exists but lacks `eventId`/`subscriberId`/`subscriberUrl`/`payload` (`{ error: "Dead-letter job is missing replay data" }`).
+  - `401 Unauthorized` / `503`: missing/invalid `X-Admin-Api-Key` / unconfigured `ADMIN_API_KEY` (admin middleware, all DLQ routes).
   - `404 Not Found`: Dead letter job does not exist in DLQ.
   - `409 Conflict`: Replay job is already active or waiting in `webhook-delivery`.
 
@@ -1137,10 +1139,11 @@ scripts. All sections above now reflect the fixed implementation.
 
 ### Docker Compose (`docker-compose.yml`)
 Orchestrates four services:
-1. `app`: Builds local Dockerfile, runs API server, mounts `./logs:/app/logs`, exposes port `3000`. Depends on `mongo` and `redis` healthchecks.
-2. `worker`: Builds local Dockerfile with override `command: node src/workers/deliveryWorker.js`, mounts `./logs:/app/logs`. Depends on `mongo` and `redis` healthchecks.
-3. `mongo`: Official `mongo:7`, healthchecked via `mongosh --eval "db.adminCommand('ping')"`, persists data to volume `mongo_data`.
-4. `redis`: Official `redis:7-alpine`, healthchecked via `redis-cli ping`, persists data to volume `redis_data`.
+1. `app`: Builds local Dockerfile, runs API server (`node src/app.js` via image `CMD`), mounts `./logs:/app/logs`, exposes port `3000`. Environment wiring: `PORT=3000`, `MONGODB_URI=mongodb://mongo:27017/webhook-delivery`, `REDIS_HOST=redis`, `REDIS_PORT=6379`, `NODE_ENV=production`, `WEBHOOK_ENCRYPTION_KEY=${WEBHOOK_ENCRYPTION_KEY}` and `ADMIN_API_KEY=${ADMIN_API_KEY}` (from host `.env`, never baked into the image — see `.dockerignore` which excludes `.env*`, `node_modules/`, `logs/`), `DISABLE_SSRF_CHECK=${DISABLE_SSRF_CHECK:-false}` (demo-only bypass, protection on by default), `DISABLE_RECOVERY=false`. Depends on `mongo` and `redis` healthchecks (`depends_on: service_healthy`), `restart: unless-stopped`.
+2. `worker`: Same image with override `command: node src/workers/deliveryWorker.js`, same `./logs:/app/logs` mount and `MONGODB_URI`/`REDIS_HOST`/`REDIS_PORT`/`NODE_ENV`/`WEBHOOK_ENCRYPTION_KEY`/`ADMIN_API_KEY`/`DISABLE_SSRF_CHECK`/`DISABLE_RECOVERY` wiring (no `PORT` — no HTTP server). Same health-gated `depends_on`, `restart: unless-stopped`. Graceful shutdown: API closes server/recovery/queues/both Redis/Mongo (`SHUTDOWN_TIMEOUT_MS` force-exit); worker `deliveryWorker.close()` drains in-flight jobs.
+3. `mongo`: Official `mongo:7`, healthchecked via `mongosh --eval "db.adminCommand('ping')"` (5s interval, 3s timeout, 5 retries), persists data to volume `mongo_data`.
+4. `redis`: Official `redis:7-alpine`, healthchecked via `redis-cli ping` (same thresholds), persists data to volume `redis_data`.
+- **Mock networking:** mocks run on the host, not in Compose. The worker inside Docker cannot reach host `localhost`; use `SUBSCRIBER_URL=http://host.docker.internal:4000/receive` with `DISABLE_SSRF_CHECK=true` in host `.env` for the local demo only (never production).
 
 To start all services:
 ```bash
